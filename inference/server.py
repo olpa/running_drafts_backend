@@ -17,7 +17,7 @@ os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 import numpy as np
 import soundfile as sf
 import uvicorn
-from fastapi import FastAPI, Form, HTTPException, UploadFile
+from fastapi import FastAPI, Form, HTTPException, Response, UploadFile
 from pydantic import BaseModel
 
 from vllm import SamplingParams
@@ -83,6 +83,15 @@ def create_app(engine_args: AsyncEngineArgs) -> FastAPI:
             engine.shutdown()
 
     app = FastAPI(lifespan=lifespan)
+
+    @app.get("/health")
+    async def health() -> Response:
+        """200 if the engine is alive, 503 if it has died."""
+        try:
+            await app.state.engine.check_health()
+        except Exception:
+            return Response(status_code=503)
+        return Response(status_code=200)
 
     @app.post("/v1/audio/transcriptions", response_model=TranscriptionResponse)
     async def transcribe(

@@ -21,6 +21,8 @@ Set `HF_HUB_OFFLINE=1` to start without network once the model is cached.
 
 ## API
 
+`GET /health`: 200 while the engine is alive, 503 once it has died.
+
 `POST /v1/audio/transcriptions` (multipart form)
 
 | field         | default | meaning                         |
