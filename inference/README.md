@@ -31,6 +31,7 @@ Set `HF_HUB_OFFLINE=1` to start without network once the model is cached.
 | `language`    | `en`    | Whisper language code           |
 | `temperature` | `0.0`   | sampling temperature            |
 | `top_logprobs`| none    | return per-token logprobs with up to N alternatives (max 20) |
+| `starting_tokens` | none | token id; repeat the field for a list |
 
 Response: `{"text": "..."}`, plus with `top_logprobs`:
 
@@ -44,6 +45,12 @@ Response: `{"text": "..."}`, plus with `top_logprobs`:
 
 `top_alternatives` is sorted best first and includes the sampled token, so
 it can hold N+1 entries. The trailing end-of-text token is included.
+
+`starting_tokens` forces the start of the decoding: the ids are appended
+to the decoder prompt after Whisper's special-token prefix
+(`<|startoftranscript|><|lang|><|transcribe|><|notimestamps|>`). They are
+context, not sampled, so they appear neither in `text` nor in
+`token_logprobs`; sampling continues right after them.
 
 ## Environment
 

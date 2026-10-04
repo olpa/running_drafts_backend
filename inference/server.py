@@ -138,10 +138,23 @@ def create_app(engine_args: AsyncEngineArgs) -> FastAPI:
         language: str = Form("en"),
         temperature: float = Form(0.0),
         top_logprobs: int | None = Form(None, ge=0),
+        starting_tokens: list[int] | None = Form(None),
     ) -> TranscriptionResponse:
         engine: AsyncLLM = app.state.engine
         audio = load_audio(await file.read())
         prompt_ids = decoder_prefix(engine, language)
+        if starting_tokens:
+            # Forced as decoder context, not sampled: they never appear in
+            # the output text or token_logprobs.
+            vocab_size = len(engine.get_tokenizer())
+            if not all(0 <= t < vocab_size for t in starting_tokens):
+                raise HTTPException(
+                    400, f"starting_tokens must be in [0, {vocab_size})"
+                )
+            prompt_ids = prompt_ids + starting_tokens
+        max_tokens = engine.model_config.max_model_len - len(prompt_ids)
+        if max_tokens < 1:
+            raise HTTPException(400, "starting_tokens is too long")
 
         prompt = {
             "encoder_prompt": {
@@ -153,7 +166,7 @@ def create_app(engine_args: AsyncEngineArgs) -> FastAPI:
         sampling_params = SamplingParams(
             temperature=temperature,
             logprobs=top_logprobs,
-            max_tokens=engine.model_config.max_model_len - len(prompt_ids),
+            max_tokens=max_tokens,
             output_kind=RequestOutputKind.FINAL_ONLY,
         )
 
