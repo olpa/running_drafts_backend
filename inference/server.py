@@ -23,6 +23,7 @@ from pydantic import BaseModel
 from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.exceptions import VLLMClientError
+from vllm.outputs import CompletionOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -32,8 +33,23 @@ SAMPLE_RATE = 16000
 MAX_AUDIO_SECONDS = 30.0
 
 
+class TokenAlternative(BaseModel):
+    token_id: int
+    logprob: float
+
+
+class TokenLogprob(BaseModel):
+    token_id: int
+    """The token id that was actually sampled at this position."""
+    logprob: float
+    top_alternatives: list[TokenAlternative]
+    """Most likely tokens at this position, best first; includes the
+    sampled token."""
+
+
 class TranscriptionResponse(BaseModel):
     text: str
+    token_logprobs: list[TokenLogprob] | None = None
 
 
 def load_audio(data: bytes) -> np.ndarray:
@@ -53,6 +69,25 @@ def load_audio(data: bytes) -> np.ndarray:
             400, f"Audio must be at most {MAX_AUDIO_SECONDS} s, got {duration:.2f} s"
         )
     return audio
+
+
+def token_logprobs(completion: CompletionOutput) -> list[TokenLogprob]:
+    result = []
+    for token_id, position in zip(completion.token_ids, completion.logprobs):
+        alternatives = sorted(
+            position.items(), key=lambda item: item[1].logprob, reverse=True
+        )
+        result.append(
+            TokenLogprob(
+                token_id=token_id,
+                logprob=position[token_id].logprob,
+                top_alternatives=[
+                    TokenAlternative(token_id=alt_id, logprob=alt.logprob)
+                    for alt_id, alt in alternatives
+                ],
+            )
+        )
+    return result
 
 
 def decoder_prefix(engine: AsyncLLM, language: str) -> list[int]:
@@ -93,11 +128,16 @@ def create_app(engine_args: AsyncEngineArgs) -> FastAPI:
             return Response(status_code=503)
         return Response(status_code=200)
 
-    @app.post("/v1/audio/transcriptions", response_model=TranscriptionResponse)
+    @app.post(
+        "/v1/audio/transcriptions",
+        response_model=TranscriptionResponse,
+        response_model_exclude_none=True,
+    )
     async def transcribe(
         file: UploadFile,
         language: str = Form("en"),
         temperature: float = Form(0.0),
+        top_logprobs: int | None = Form(None, ge=0),
     ) -> TranscriptionResponse:
         engine: AsyncLLM = app.state.engine
         audio = load_audio(await file.read())
@@ -112,6 +152,7 @@ def create_app(engine_args: AsyncEngineArgs) -> FastAPI:
         }
         sampling_params = SamplingParams(
             temperature=temperature,
+            logprobs=top_logprobs,
             max_tokens=engine.model_config.max_model_len - len(prompt_ids),
             output_kind=RequestOutputKind.FINAL_ONLY,
         )
@@ -127,7 +168,12 @@ def create_app(engine_args: AsyncEngineArgs) -> FastAPI:
         assert final is not None and final.finished
 
         completion = final.outputs[0]
-        return TranscriptionResponse(text=completion.text.strip())
+        return TranscriptionResponse(
+            text=completion.text.strip(),
+            token_logprobs=(
+                token_logprobs(completion) if top_logprobs is not None else None
+            ),
+        )
 
     return app
 

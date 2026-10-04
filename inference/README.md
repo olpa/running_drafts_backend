@@ -30,8 +30,20 @@ Set `HF_HUB_OFFLINE=1` to start without network once the model is cached.
 | `file`        |         | audio file                      |
 | `language`    | `en`    | Whisper language code           |
 | `temperature` | `0.0`   | sampling temperature            |
+| `top_logprobs`| none    | return per-token logprobs with up to N alternatives (max 20) |
 
-Response: `{"text": "..."}`
+Response: `{"text": "..."}`, plus with `top_logprobs`:
+
+```json
+"token_logprobs": [
+  {"token_id": 708, "logprob": -0.01,
+   "top_alternatives": [{"token_id": 708, "logprob": -0.01}, ...]},
+  ...
+]
+```
+
+`top_alternatives` is sorted best first and includes the sampled token, so
+it can hold N+1 entries. The trailing end-of-text token is included.
 
 ## Environment
 
