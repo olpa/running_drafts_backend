@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 import numpy as np
+import prometheus_client
 import soundfile as sf
 import uvicorn
 from fastapi import FastAPI, Form, HTTPException, Response, UploadFile
@@ -28,6 +29,7 @@ from vllm.sampling_params import RequestOutputKind
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.v1.engine.async_llm import AsyncLLM
+from vllm.v1.metrics.prometheus import get_prometheus_registry
 
 SAMPLE_RATE = 16000
 MAX_AUDIO_SECONDS = 30.0
@@ -127,6 +129,14 @@ def create_app(engine_args: AsyncEngineArgs) -> FastAPI:
         except Exception:
             return Response(status_code=503)
         return Response(status_code=200)
+
+    @app.get("/metrics")
+    async def metrics() -> Response:
+        """vLLM engine metrics (`vllm:*`) in Prometheus text format."""
+        return Response(
+            prometheus_client.generate_latest(get_prometheus_registry()),
+            media_type=prometheus_client.CONTENT_TYPE_LATEST,
+        )
 
     @app.post(
         "/v1/audio/transcriptions",

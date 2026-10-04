@@ -23,6 +23,9 @@ Set `HF_HUB_OFFLINE=1` to start without network once the model is cached.
 
 `GET /health`: 200 while the engine is alive, 503 once it has died.
 
+`GET /metrics`: vLLM engine metrics in Prometheus format (`vllm:*`:
+request counts, token counts, latency histograms, KV-cache usage, ...).
+
 `POST /v1/audio/transcriptions` (multipart form)
 
 | field         | default | meaning                         |
