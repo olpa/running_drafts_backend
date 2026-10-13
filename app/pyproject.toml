@@ -1,0 +1,39 @@
+[project]
+name = "running-drafts"
+version = "0.1.0"
+description = "Running Drafts application backend"
+requires-python = ">=3.15,<3.16"
+dependencies = [
+    "fastapi>=0.118",
+    "pydantic-settings>=2.11",
+    "uvicorn>=0.37",
+]
+
+[project.scripts]
+running-drafts = "running_drafts.cli:main"
+
+[dependency-groups]
+dev = [
+    "httpx2>=0.1",
+    "pytest>=8.4",
+    "ruff>=0.14",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+markers = ["container: requires a working Docker daemon and builds application images"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py315"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/running_drafts"]
