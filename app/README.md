@@ -51,6 +51,20 @@ and `/openapi.json`; production disables both. `/health/live` never touches the
 database. `/health/ready` opens the database without creating it, runs a query,
 checks WAL mode, and requires the exact application migration head.
 
+## Database space maintenance
+
+New databases use SQLite incremental auto-vacuum. Deleted pages remain reusable
+immediately; returning them to the host filesystem is an explicit bounded
+maintenance operation:
+
+```bash
+uv run running-drafts incremental-vacuum --pages 1000
+```
+
+Run small batches periodically or after substantial deletion. Each batch is a
+write operation and may briefly wait for or delay another writer. In WAL mode,
+the physical database file is truncated when the vacuum changes are checkpointed.
+
 ## Tests
 
 ```bash

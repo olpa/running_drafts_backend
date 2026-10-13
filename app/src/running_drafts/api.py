@@ -12,6 +12,14 @@ from running_drafts.auth import ensure_authentication_adapter_is_available
 from running_drafts.database import DatabaseConfigurationError, existing_connection
 from running_drafts.migrations import MIGRATION_HEAD
 from running_drafts.problems import ProblemException, problem_response
+from running_drafts.project_api import router as project_router
+from running_drafts.project_storage import (
+    AudioAssetSealConflict,
+    DatabaseBusy,
+    DatabaseUnavailable,
+    IdempotencyKeyReused,
+    ResourceNotFound,
+)
 from running_drafts.settings import AppEnvironment, Settings
 
 logger = logging.getLogger(__name__)
@@ -64,6 +72,60 @@ def create_app(settings: Settings) -> FastAPI:
             detail=error.detail,
             code=error.code,
             headers=error.headers,
+        )
+
+    @app.exception_handler(ResourceNotFound)
+    def handle_not_found(_request: Request, _error: ResourceNotFound) -> JSONResponse:
+        return problem_response(
+            status=404,
+            title="Resource not found",
+            detail="The requested resource was not found.",
+            code="resource_not_found",
+        )
+
+    @app.exception_handler(IdempotencyKeyReused)
+    def handle_idempotency_reuse(
+        _request: Request,
+        _error: IdempotencyKeyReused,
+    ) -> JSONResponse:
+        return problem_response(
+            status=409,
+            title="Idempotency key reused",
+            detail="The idempotency key was already used with different input.",
+            code="idempotency_key_reused",
+        )
+
+    @app.exception_handler(AudioAssetSealConflict)
+    def handle_seal_conflict(
+        _request: Request,
+        _error: AudioAssetSealConflict,
+    ) -> JSONResponse:
+        return problem_response(
+            status=409,
+            title="Audio asset seal conflict",
+            detail="The audio asset cannot be sealed with this command.",
+            code="audio_asset_seal_conflict",
+        )
+
+    @app.exception_handler(DatabaseBusy)
+    def handle_database_busy(_request: Request, _error: DatabaseBusy) -> JSONResponse:
+        return problem_response(
+            status=503,
+            title="Database busy",
+            detail="The database is busy. The request may be retried.",
+            code="database_busy",
+        )
+
+    @app.exception_handler(DatabaseUnavailable)
+    def handle_database_unavailable(
+        _request: Request,
+        _error: DatabaseUnavailable,
+    ) -> JSONResponse:
+        return problem_response(
+            status=503,
+            title="Database unavailable",
+            detail="The database is unavailable.",
+            code="database_unavailable",
         )
 
     @app.exception_handler(RequestValidationError)
@@ -143,5 +205,5 @@ def create_app(settings: Settings) -> FastAPI:
         return {"status": "ok"}
 
     app.include_router(health)
-    app.include_router(APIRouter(prefix="/api/v1"))
+    app.include_router(project_router)
     return app

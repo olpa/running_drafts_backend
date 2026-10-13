@@ -35,7 +35,10 @@ def _execute_sql_resource(filename: str) -> MigrationAction:
     return apply
 
 
-MIGRATIONS = (Migration(1, _execute_sql_resource("0001_users.sql")),)
+MIGRATIONS = (
+    Migration(1, _execute_sql_resource("0001_users.sql")),
+    Migration(2, _execute_sql_resource("0002_projects.sql")),
+)
 MIGRATION_HEAD = MIGRATIONS[-1].version
 
 
@@ -48,6 +51,15 @@ def migrate(settings: DatabaseSettings) -> int:
     )
     try:
         connection.execute(f"PRAGMA busy_timeout = {settings.database_busy_timeout_ms}")
+        current = connection.execute("PRAGMA user_version").fetchone()[0]
+        auto_vacuum = connection.execute("PRAGMA auto_vacuum").fetchone()[0]
+        if current == 0:
+            connection.execute("PRAGMA auto_vacuum = INCREMENTAL")
+            auto_vacuum = connection.execute("PRAGMA auto_vacuum").fetchone()[0]
+        if auto_vacuum != 2:
+            raise MigrationError(
+                "database does not use incremental auto-vacuum; recreate this pre-release database"
+            )
         journal_mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
         if journal_mode.lower() != "wal":
             raise MigrationError("failed to enable WAL journal mode")
@@ -56,7 +68,6 @@ def migrate(settings: DatabaseSettings) -> int:
             busy_timeout_ms=settings.database_busy_timeout_ms,
             require_wal=True,
         )
-        current = connection.execute("PRAGMA user_version").fetchone()[0]
         if current > MIGRATION_HEAD:
             raise MigrationError(
                 f"database schema version {current} is newer than head {MIGRATION_HEAD}"

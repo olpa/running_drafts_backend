@@ -1,6 +1,17 @@
 from typing import Any
 
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict
+
+
+class ProblemDetails(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    type: str
+    title: str
+    status: int
+    detail: str
+    code: str
 
 
 class ProblemException(Exception):
