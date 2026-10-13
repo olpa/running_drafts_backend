@@ -45,6 +45,19 @@ def test_fixtures_never_create_a_missing_database(tmp_path: Path) -> None:
     assert json.loads(result.stderr)["event"] == "command_failed"
 
 
+def test_incremental_vacuum_is_an_explicit_bounded_command(tmp_path: Path) -> None:
+    database_path = tmp_path / "application.sqlite3"
+    assert run_command("migrate", database_path).returncode == 0
+
+    result = run_command("incremental-vacuum", database_path)
+
+    assert result.returncode == 0, result.stderr
+    event = json.loads(result.stdout)
+    assert event["event"] == "database_incrementally_vacuumed"
+    assert event["pagesBefore"] >= event["pagesAfter"]
+    assert event["reclaimedPages"] == event["pagesBefore"] - event["pagesAfter"]
+
+
 def test_migrate_refuses_a_future_schema(tmp_path: Path) -> None:
     database_path = tmp_path / "future.sqlite3"
     assert run_command("migrate", database_path).returncode == 0

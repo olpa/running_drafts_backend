@@ -76,7 +76,7 @@ def test_compose_migrates_seeds_serves_and_restarts() -> None:
         compose("up", "-d", "--build", "api")
         base_url = api_base_url()
 
-        assert last_json_event(migrated.stdout)["schema_version"] == 1
+        assert last_json_event(migrated.stdout)["schema_version"] == 2
         assert last_json_event(fixtures.stdout)["insertedUsers"] == 1
         assert wait_for(f"{base_url}/health/live") == {"status": "ok"}
         assert wait_for(f"{base_url}/health/ready") == {"status": "ok"}

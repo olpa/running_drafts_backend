@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from running_drafts.api import create_app
 from running_drafts.auth import ensure_authentication_adapter_is_available
 from running_drafts.fixtures import FixtureError, create_fixtures
+from running_drafts.maintenance import MaintenanceError, incremental_vacuum
 from running_drafts.migrations import MigrationError, migrate
 from running_drafts.settings import DatabaseSettings, FixtureSettings, Settings
 from running_drafts.structured_logging import LOGGING_CONFIG, write_event
@@ -20,6 +21,8 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("migrate")
     commands.add_parser("fixtures")
+    vacuum = commands.add_parser("incremental-vacuum")
+    vacuum.add_argument("--pages", type=int, default=1_000)
     commands.add_parser("serve")
     return parser
 
@@ -35,6 +38,15 @@ def run(argv: Sequence[str] | None = None) -> int:
             inserted = create_fixtures(FixtureSettings())
             write_event("fixtures_created", insertedUsers=inserted)
             return 0
+        if arguments.command == "incremental-vacuum":
+            result = incremental_vacuum(DatabaseSettings(), pages=arguments.pages)
+            write_event(
+                "database_incrementally_vacuumed",
+                pagesBefore=result.pages_before,
+                pagesAfter=result.pages_after,
+                reclaimedPages=result.reclaimed_pages,
+            )
+            return 0
         if arguments.command == "serve":
             settings = Settings()
             ensure_authentication_adapter_is_available(settings)
@@ -48,6 +60,7 @@ def run(argv: Sequence[str] | None = None) -> int:
             return 0
     except (
         FixtureError,
+        MaintenanceError,
         MigrationError,
         RuntimeError,
         ValidationError,
