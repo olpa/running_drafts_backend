@@ -1,0 +1,48 @@
+x-database-environment: &database-environment
+  APP_ENV: ${APP_ENV:?Set APP_ENV to development, test, or production}
+  AUTH_MODE: ${AUTH_MODE:?Set AUTH_MODE to basic or auth0}
+  DATABASE_PATH: /data/running-drafts.sqlite3
+  DATABASE_BUSY_TIMEOUT_MS: ${DATABASE_BUSY_TIMEOUT_MS:-5000}
+  BASIC_AUTH_USERNAMES: '${BASIC_AUTH_USERNAMES:-[]}'
+
+services:
+  api:
+    build:
+      context: .
+      target: api
+    environment:
+      <<: *database-environment
+      ALLOWED_ORIGINS: '${ALLOWED_ORIGINS:?Set ALLOWED_ORIGINS to a JSON array}'
+      BASIC_AUTH_PASSWORD: ${BASIC_AUTH_PASSWORD:?Set BASIC_AUTH_PASSWORD}
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: 8000
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - application-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=2)
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  db-admin:
+    profiles: [tools]
+    build:
+      context: .
+      target: db-admin
+    environment:
+      <<: *database-environment
+    volumes:
+      - application-data:/data
+
+volumes:
+  application-data:

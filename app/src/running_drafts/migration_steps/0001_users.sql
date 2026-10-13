@@ -1,0 +1,9 @@
+CREATE TABLE users (
+    id TEXT PRIMARY KEY NOT NULL,
+    created_at_ms INTEGER NOT NULL
+);
+
+CREATE TABLE basic_auth_identities (
+    username TEXT PRIMARY KEY NOT NULL COLLATE BINARY,
+    user_id TEXT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE
+);
