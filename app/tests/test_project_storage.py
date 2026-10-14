@@ -11,7 +11,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from running_drafts.database import existing_connection
-from running_drafts.project_storage import ProjectStorage
+from running_drafts.project_storage import FrameConflict, ProjectStorage, ResourceNotFound
 
 
 def run_admin(command: str, database_path: Path) -> subprocess.CompletedProcess[str]:
@@ -128,6 +128,138 @@ def test_state_survives_reopening_the_storage(tmp_path: Path) -> None:
     assert detail.sections[0].audio_asset.seal_reason == "completed"
 
 
+def test_first_audio_frame_is_acknowledged_and_survives_restart(tmp_path: Path) -> None:
+    database_path = migrated_database(tmp_path)
+    owner_id = user_id(database_path)
+    moments = iter([1_000, 2_000, 3_000])
+    store = storage(database_path, clock_ms=lambda: next(moments))
+    project = store.create_project(owner_id, uuid4(), "Persistent audio").value
+    asset_id = store.create_section(
+        owner_id,
+        project.id,
+        uuid4(),
+        "audio/webm;codecs=opus",
+    ).value.audio_asset_id
+
+    acknowledgement = store.accept_audio_frame(
+        owner_id,
+        asset_id,
+        sequence=0,
+        start_ms=0,
+        end_ms=1_000,
+        media_type="audio/webm;codecs=opus",
+        payload=b"frame-one",
+    )
+
+    assert acknowledgement.sequence == 0
+    assert acknowledgement.sha256 == (
+        "70a09fbff3df33ed9f6db65155e3a6e166de73e2ceab15d42103d688fc904eaa"
+    )
+    assert acknowledgement.next_expected_sequence == 1
+    restarted_store = storage(database_path)
+    restarted_detail = restarted_store.get_project(owner_id, project.id)
+    assert restarted_detail.project.updated_at_ms == 3_000
+    assert restarted_detail.sections[0].audio_asset.frame_count == 1
+    assert restarted_detail.sections[0].audio_asset.observed_duration_ms == 1_000
+    assert restarted_detail.sections[0].audio_asset.stored_bytes == 9
+    replay = restarted_store.accept_audio_frame(
+        owner_id,
+        asset_id,
+        sequence=0,
+        start_ms=0,
+        end_ms=1_000,
+        media_type="audio/webm;codecs=opus",
+        payload=b"frame-one",
+    )
+    assert replay.next_expected_sequence == 1
+
+
+def test_audio_frame_replays_are_idempotent_and_return_the_current_cursor(
+    tmp_path: Path,
+) -> None:
+    database_path = migrated_database(tmp_path)
+    owner_id = user_id(database_path)
+    store = storage(database_path, clock_ms=lambda: 1_000)
+    project = store.create_project(owner_id, uuid4(), "Replays").value
+    asset_id = store.create_section(
+        owner_id,
+        project.id,
+        uuid4(),
+        "audio/webm;codecs=opus",
+    ).value.audio_asset_id
+    first = store.accept_audio_frame(
+        owner_id,
+        asset_id,
+        sequence=0,
+        start_ms=0,
+        end_ms=1_000,
+        media_type="audio/webm;codecs=opus",
+        payload=b"frame-one",
+    )
+    second = store.accept_audio_frame(
+        owner_id,
+        asset_id,
+        sequence=1,
+        start_ms=1_000,
+        end_ms=2_000,
+        media_type="audio/webm;codecs=opus",
+        payload=b"frame-two",
+    )
+    updated_at_ms = store.get_project(owner_id, project.id).project.updated_at_ms
+
+    replay = store.accept_audio_frame(
+        owner_id,
+        asset_id,
+        sequence=0,
+        start_ms=0,
+        end_ms=1_000,
+        media_type=' AUDIO/WEBM ; Codecs = "OPUS" ',
+        payload=b"frame-one",
+    )
+
+    assert first.next_expected_sequence == 1
+    assert second.next_expected_sequence == 2
+    assert replay.sha256 == first.sha256
+    assert replay.next_expected_sequence == 2
+    assert store.get_project(owner_id, project.id).project.updated_at_ms == updated_at_ms
+
+    conflicting_requests = [
+        {"sequence": 3, "start_ms": 2_000, "end_ms": 3_000, "payload": b"gap"},
+        {"sequence": 0, "start_ms": 0, "end_ms": 1_000, "payload": b"changed"},
+        {"sequence": 0, "start_ms": 0, "end_ms": 999, "payload": b"frame-one"},
+    ]
+    for request in conflicting_requests:
+        with pytest.raises(FrameConflict):
+            store.accept_audio_frame(
+                owner_id,
+                asset_id,
+                media_type="audio/webm;codecs=opus",
+                **request,
+            )
+
+    store.complete_audio_asset(owner_id, asset_id, 2)
+    sealed_replay = store.accept_audio_frame(
+        owner_id,
+        asset_id,
+        sequence=0,
+        start_ms=0,
+        end_ms=1_000,
+        media_type="audio/webm;codecs=opus",
+        payload=b"frame-one",
+    )
+    assert sealed_replay.next_expected_sequence == 2
+    with pytest.raises(FrameConflict):
+        store.accept_audio_frame(
+            owner_id,
+            asset_id,
+            sequence=2,
+            start_ms=2_000,
+            end_ms=3_000,
+            media_type="audio/webm;codecs=opus",
+            payload=b"new-after-seal",
+        )
+
+
 def test_concurrent_section_creation_assigns_a_stable_total_order(tmp_path: Path) -> None:
     database_path = migrated_database(tmp_path)
     owner_id = user_id(database_path)
@@ -222,13 +354,23 @@ def test_frame_and_seal_transactions_follow_database_order(tmp_path: Path) -> No
     ).value
     frame_ready = Event()
     allow_frame_commit = Event()
+
+    def frame_clock() -> int:
+        frame_ready.set()
+        assert allow_frame_commit.wait(timeout=5)
+        return 3_000
+
+    frame_store = storage(database_path, clock_ms=frame_clock)
     with ThreadPoolExecutor(max_workers=2) as executor:
         accepting = executor.submit(
-            accept_test_frame,
-            database_path,
+            frame_store.accept_audio_frame,
+            owner_id,
             frame_first.audio_asset_id,
-            ready_to_commit=frame_ready,
-            allow_commit=allow_frame_commit,
+            sequence=0,
+            start_ms=0,
+            end_ms=1_000,
+            media_type="audio/webm;codecs=opus",
+            payload=b"frame",
         )
         assert frame_ready.wait(timeout=5)
         sealing_after_frame = executor.submit(
@@ -238,7 +380,7 @@ def test_frame_and_seal_transactions_follow_database_order(tmp_path: Path) -> No
             1,
         )
         allow_frame_commit.set()
-        assert accepting.result()
+        assert accepting.result().next_expected_sequence == 1
         completed = sealing_after_frame.result()
     assert completed.frame_count == 1
     assert completed.observed_duration_ms == 1_000
@@ -267,13 +409,81 @@ def test_frame_and_seal_transactions_follow_database_order(tmp_path: Path) -> No
         )
         assert sealing_has_lock.wait(timeout=5)
         accepting_after_seal = executor.submit(
-            accept_test_frame,
-            database_path,
+            store.accept_audio_frame,
+            owner_id,
             seal_first.audio_asset_id,
+            sequence=0,
+            start_ms=0,
+            end_ms=1_000,
+            media_type="audio/webm;codecs=opus",
+            payload=b"frame",
         )
         release_seal.set()
         assert sealing.result().seal_reason == "interrupted"
-        assert not accepting_after_seal.result()
+        with pytest.raises(FrameConflict):
+            accepting_after_seal.result()
+
+
+def test_overlapping_frame_writers_store_and_charge_once(tmp_path: Path) -> None:
+    database_path = migrated_database(tmp_path)
+    owner_id = user_id(database_path)
+    store = storage(database_path)
+    project = store.create_project(owner_id, uuid4(), "Concurrent frames").value
+    asset_id = store.create_section(
+        owner_id,
+        project.id,
+        uuid4(),
+        "audio/webm;codecs=opus",
+    ).value.audio_asset_id
+
+    def upload(payload: bytes) -> object:
+        return storage(database_path).accept_audio_frame(
+            owner_id,
+            asset_id,
+            sequence=0,
+            start_ms=0,
+            end_ms=1_000,
+            media_type="audio/webm;codecs=opus",
+            payload=payload,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        identical = list(executor.map(upload, [b"same-frame", b"same-frame"]))
+
+    assert [item.next_expected_sequence for item in identical] == [1, 1]
+    detail = store.get_project(owner_id, project.id)
+    assert detail.sections[0].audio_asset.frame_count == 1
+    assert detail.sections[0].audio_asset.stored_bytes == 10
+
+    competing_asset_id = store.create_section(
+        owner_id,
+        project.id,
+        uuid4(),
+        "audio/webm;codecs=opus",
+    ).value.audio_asset_id
+
+    def compete(payload: bytes) -> str:
+        try:
+            storage(database_path).accept_audio_frame(
+                owner_id,
+                competing_asset_id,
+                sequence=0,
+                start_ms=0,
+                end_ms=1_000,
+                media_type="audio/webm;codecs=opus",
+                payload=payload,
+            )
+        except FrameConflict:
+            return "conflict"
+        return "accepted"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(compete, [b"first", b"second"]))
+
+    assert sorted(outcomes) == ["accepted", "conflict"]
+    competing = store.get_project(owner_id, project.id).sections[1].audio_asset
+    assert competing.frame_count == 1
+    assert competing.stored_bytes in {5, 6}
 
 
 def test_usage_is_derived_from_owned_audio_assets(tmp_path: Path) -> None:
@@ -346,3 +556,36 @@ def test_database_constraints_guard_ordering_frames_and_seal_state(tmp_path: Pat
                 """,
                 (str(section.audio_asset_id), "1" * 64),
             )
+
+
+def test_project_database_cascade_removes_stored_frames(tmp_path: Path) -> None:
+    database_path = migrated_database(tmp_path)
+    owner_id = user_id(database_path)
+    store = storage(database_path)
+    project = store.create_project(owner_id, uuid4(), "Delete later").value
+    asset_id = store.create_section(
+        owner_id,
+        project.id,
+        uuid4(),
+        "audio/webm;codecs=opus",
+    ).value.audio_asset_id
+    store.accept_audio_frame(
+        owner_id,
+        asset_id,
+        sequence=0,
+        start_ms=0,
+        end_ms=1_000,
+        media_type="audio/webm;codecs=opus",
+        payload=b"frame",
+    )
+
+    with existing_connection(database_path, busy_timeout_ms=5_000) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("DELETE FROM projects WHERE id = ?", (str(project.id),))
+        connection.commit()
+        frame_count = connection.execute("SELECT count(*) FROM transport_frames").fetchone()[0]
+
+    assert frame_count == 0
+    assert store.used_audio_bytes(owner_id) == 0
+    with pytest.raises(ResourceNotFound):
+        store.get_project(owner_id, project.id)

@@ -2,14 +2,16 @@ from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Request, Response, status
+from fastapi import APIRouter, Depends, Header, Path, Request, Response, status
 from pydantic import Field, field_validator
+from starlette.concurrency import run_in_threadpool
 
 from running_drafts.auth import authenticated_user_id
 from running_drafts.models import UUID4, CamelCaseRequest, CamelCaseResponse
-from running_drafts.problems import ProblemDetails
+from running_drafts.problems import ProblemDetails, ProblemException
 from running_drafts.project_storage import (
     AudioAssetSummary,
+    FrameAcknowledgement,
     InvalidTitle,
     ProjectDetail,
     ProjectStorage,
@@ -19,7 +21,9 @@ from running_drafts.project_storage import (
     canonicalize_media_type,
     normalize_title,
 )
-from running_drafts.settings import Settings
+from running_drafts.settings import DEFAULT_MAX_TRANSPORT_FRAME_BYTES, Settings
+
+MAX_SQLITE_INTEGER = 2**63 - 1
 
 
 class CreateProjectRequest(CamelCaseRequest):
@@ -106,6 +110,13 @@ class CreateSectionResponse(CamelCaseResponse):
     position: int
 
 
+class FrameAcknowledgementResponse(CamelCaseResponse):
+    sequence: int = Field(ge=0)
+    acknowledged: Literal[True] = True
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    next_expected_sequence: int = Field(ge=0)
+
+
 def _datetime(timestamp_ms: int | None) -> datetime | None:
     if timestamp_ms is None:
         return None
@@ -163,6 +174,55 @@ def _section_creation_response(section: SectionCreation) -> CreateSectionRespons
     )
 
 
+def _frame_acknowledgement_response(
+    acknowledgement: FrameAcknowledgement,
+) -> FrameAcknowledgementResponse:
+    return FrameAcknowledgementResponse(
+        sequence=acknowledgement.sequence,
+        sha256=acknowledgement.sha256,
+        next_expected_sequence=acknowledgement.next_expected_sequence,
+    )
+
+
+def _frame_problem(status_code: int, title: str, detail: str, code: str) -> ProblemException:
+    return ProblemException(status=status_code, title=title, detail=detail, code=code)
+
+
+async def _read_frame_body(request: Request, maximum_bytes: int) -> bytes:
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > maximum_bytes:
+                raise _frame_problem(
+                    413,
+                    "Frame too large",
+                    "The audio frame exceeds the configured size limit.",
+                    "frame_too_large",
+                )
+        except ValueError:
+            pass
+
+    body = bytearray()
+    async for chunk in request.stream():
+        remaining = maximum_bytes - len(body)
+        if len(chunk) > remaining:
+            raise _frame_problem(
+                413,
+                "Frame too large",
+                "The audio frame exceeds the configured size limit.",
+                "frame_too_large",
+            )
+        body.extend(chunk)
+    if not body:
+        raise _frame_problem(
+            422,
+            "Request validation failed",
+            "The audio frame body must not be empty.",
+            "request_validation_error",
+        )
+    return bytes(body)
+
+
 def project_storage(request: Request) -> ProjectStorage:
     settings: Settings = request.app.state.settings
     return ProjectStorage(
@@ -211,6 +271,10 @@ NOT_FOUND_RESPONSES = COMMON_RESPONSES | {
 }
 CONFLICT_RESPONSES = NOT_FOUND_RESPONSES | {
     409: _problem_response("Command conflicts with existing state"),
+}
+FRAME_RESPONSES = CONFLICT_RESPONSES | {
+    413: _problem_response("Frame body exceeds the configured size limit"),
+    415: _problem_response("Frame media type is unsupported"),
 }
 CREATED_RESPONSE = {
     "headers": {
@@ -300,6 +364,81 @@ def create_section(
     )
     response.headers["Location"] = f"/api/v1/projects/{project_id}"
     return _section_creation_response(result.value)
+
+
+@router.put(
+    "/audio-assets/{audio_asset_id}/frames/{sequence}",
+    response_model=FrameAcknowledgementResponse,
+    responses=FRAME_RESPONSES,
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {
+                "audio/webm;codecs=opus": {
+                    "schema": {
+                        "type": "string",
+                        "format": "binary",
+                        "minLength": 1,
+                        "maxLength": DEFAULT_MAX_TRANSPORT_FRAME_BYTES,
+                    }
+                }
+            },
+        }
+    },
+)
+async def upload_audio_frame(
+    request: Request,
+    audio_asset_id: UUID4,
+    sequence: Annotated[int, Path(ge=0, le=MAX_SQLITE_INTEGER)],
+    start_ms: Annotated[
+        int,
+        Header(alias="X-Frame-Start-Ms", ge=0, le=MAX_SQLITE_INTEGER),
+    ],
+    end_ms: Annotated[
+        int,
+        Header(alias="X-Frame-End-Ms", ge=0, le=MAX_SQLITE_INTEGER),
+    ],
+    user_id: AuthenticatedUser,
+    storage: Storage,
+) -> FrameAcknowledgementResponse:
+    if end_ms <= start_ms:
+        raise _frame_problem(
+            422,
+            "Request validation failed",
+            "X-Frame-End-Ms must be greater than X-Frame-Start-Ms.",
+            "request_validation_error",
+        )
+    content_type = request.headers.get("content-type")
+    if content_type is None:
+        raise _frame_problem(
+            415,
+            "Unsupported media type",
+            "Content-Type must identify WebM audio with the Opus codec.",
+            "unsupported_media_type",
+        )
+    try:
+        media_type = canonicalize_media_type(content_type)
+    except UnsupportedMediaType as error:
+        raise _frame_problem(
+            415,
+            "Unsupported media type",
+            str(error),
+            "unsupported_media_type",
+        ) from None
+    settings: Settings = request.app.state.settings
+    payload = await _read_frame_body(request, settings.max_transport_frame_bytes)
+    return _frame_acknowledgement_response(
+        await run_in_threadpool(
+            storage.accept_audio_frame,
+            user_id,
+            audio_asset_id,
+            sequence=sequence,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            media_type=media_type,
+            payload=payload,
+        )
+    )
 
 
 @router.post(

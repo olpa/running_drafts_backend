@@ -96,6 +96,29 @@ def create_section(
     return response.json(), response
 
 
+def upload_frame(
+    client: TestClient,
+    audio_asset_id: str,
+    sequence: int,
+    *,
+    payload: bytes = b"frame-one",
+    start_ms: int = 0,
+    end_ms: int = 1_000,
+    content_type: str = "audio/webm;codecs=opus",
+    username: str = "Alice",
+):
+    return client.put(
+        f"/api/v1/audio-assets/{audio_asset_id}/frames/{sequence}",
+        content=payload,
+        headers={
+            "Content-Type": content_type,
+            "X-Frame-Start-Ms": str(start_ms),
+            "X-Frame-End-Ms": str(end_ms),
+        },
+        auth=auth(username),
+    )
+
+
 def user_id(database_path: Path, username: str) -> UUID:
     with sqlite3.connect(database_path) as connection:
         value = connection.execute(
@@ -227,6 +250,150 @@ def test_section_creation_is_canonical_idempotent_and_visible_in_document(
     }
 
 
+def test_audio_frame_upload_is_acknowledged_and_visible_in_project_detail(
+    client: TestClient,
+) -> None:
+    project = create_project(client)
+    section, _response = create_section(client, project["id"])
+
+    uploaded = upload_frame(client, section["audioAssetId"], 0)
+    detail = client.get(f"/api/v1/projects/{project['id']}", auth=auth())
+
+    assert uploaded.status_code == 200, uploaded.text
+    assert uploaded.json() == {
+        "sequence": 0,
+        "acknowledged": True,
+        "sha256": "70a09fbff3df33ed9f6db65155e3a6e166de73e2ceab15d42103d688fc904eaa",
+        "nextExpectedSequence": 1,
+    }
+    asset = detail.json()["document"]["sections"][0]["audioAsset"]
+    assert asset["frameCount"] == 1
+    assert asset["observedDurationMs"] == 1_000
+    assert asset["storedBytes"] == 9
+
+
+def test_audio_frame_upload_enforces_body_media_and_timing_rules(
+    database_path: Path,
+) -> None:
+    settings = settings_for(database_path).model_copy(
+        update={"max_transport_frame_bytes": 8}
+    )
+    with TestClient(create_app(settings)) as test_client:
+        project = create_project(test_client)
+        section, _response = create_section(test_client, project["id"])
+        endpoint = f"/api/v1/audio-assets/{section['audioAssetId']}/frames/0"
+
+        zero = upload_frame(test_client, section["audioAssetId"], 0, payload=b"")
+        oversized = test_client.put(
+            endpoint,
+            content=b"123456789",
+            headers={
+                "Content-Type": "audio/webm;codecs=opus",
+                "Content-Length": "1",
+                "X-Frame-Start-Ms": "0",
+                "X-Frame-End-Ms": "1000",
+            },
+            auth=auth(),
+        )
+        unsupported = upload_frame(
+            test_client,
+            section["audioAssetId"],
+            0,
+            payload=b"frame",
+            content_type="audio/ogg;codecs=opus",
+        )
+        backwards = upload_frame(
+            test_client,
+            section["audioAssetId"],
+            0,
+            payload=b"frame",
+            start_ms=1_000,
+            end_ms=1_000,
+        )
+        exact_limit = upload_frame(
+            test_client,
+            section["audioAssetId"],
+            0,
+            payload=b"12345678",
+        )
+
+    assert zero.status_code == 422
+    assert zero.json()["code"] == "request_validation_error"
+    assert oversized.status_code == 413
+    assert oversized.json()["code"] == "frame_too_large"
+    assert unsupported.status_code == 415
+    assert unsupported.json()["code"] == "unsupported_media_type"
+    assert backwards.status_code == 422
+    assert backwards.json()["code"] == "request_validation_error"
+    assert exact_limit.status_code == 200
+
+
+def test_audio_frame_http_replays_and_conflicts_follow_asset_state(
+    client: TestClient,
+) -> None:
+    project = create_project(client)
+    section, _response = create_section(client, project["id"])
+    asset_id = section["audioAssetId"]
+    first = upload_frame(client, asset_id, 0)
+    second = upload_frame(
+        client,
+        asset_id,
+        1,
+        payload=b"frame-two",
+        start_ms=1_000,
+        end_ms=2_000,
+    )
+
+    replay = upload_frame(
+        client,
+        asset_id,
+        0,
+        content_type=' AUDIO/WEBM ; Codecs = "OPUS" ',
+    )
+    gap = upload_frame(
+        client,
+        asset_id,
+        3,
+        payload=b"gap",
+        start_ms=2_000,
+        end_ms=3_000,
+    )
+    discontinuity = upload_frame(
+        client,
+        asset_id,
+        2,
+        payload=b"discontinuous",
+        start_ms=2_001,
+        end_ms=3_000,
+    )
+    changed_replay = upload_frame(client, asset_id, 0, payload=b"changed")
+    sealed = client.post(
+        f"/api/v1/audio-assets/{asset_id}/complete",
+        json={"frameCount": 2},
+        auth=auth(),
+    )
+    replay_after_seal = upload_frame(client, asset_id, 0)
+    new_after_seal = upload_frame(
+        client,
+        asset_id,
+        2,
+        payload=b"new",
+        start_ms=2_000,
+        end_ms=3_000,
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert replay.status_code == 200
+    assert replay.json()["nextExpectedSequence"] == 2
+    for conflict in (gap, discontinuity, changed_replay, new_after_seal):
+        assert conflict.status_code == 409
+        assert conflict.json()["code"] == "frame_conflict"
+    assert sealed.status_code == 200
+    assert replay_after_seal.status_code == 200
+    assert replay_after_seal.json()["nextExpectedSequence"] == 2
+
+
 def test_cross_user_access_is_privacy_preserving(client: TestClient) -> None:
     project = create_project(client)
     section, _response = create_section(client, project["id"])
@@ -249,6 +416,13 @@ def test_cross_user_access_is_privacy_preserving(client: TestClient) -> None:
         client.post(
             f"/api/v1/audio-assets/{section['audioAssetId']}/interrupt",
             auth=auth("Bob"),
+        ),
+        upload_frame(
+            client,
+            section["audioAssetId"],
+            0,
+            payload=b"private",
+            username="Bob",
         ),
     ]
     missing = client.get(f"/api/v1/projects/{uuid4()}", auth=auth("Bob"))
@@ -334,6 +508,7 @@ def test_openapi_declares_routes_security_locations_and_problem_details(
         "/api/v1/projects",
         "/api/v1/projects/{project_id}",
         "/api/v1/projects/{project_id}/sections",
+        "/api/v1/audio-assets/{audio_asset_id}/frames/{sequence}",
         "/api/v1/audio-assets/{audio_asset_id}/complete",
         "/api/v1/audio-assets/{audio_asset_id}/interrupt",
     } <= paths.keys()
@@ -345,25 +520,95 @@ def test_openapi_declares_routes_security_locations_and_problem_details(
     assert "requestBody" not in paths[
         "/api/v1/audio-assets/{audio_asset_id}/interrupt"
     ]["post"]
+    frame_operation = paths[
+        "/api/v1/audio-assets/{audio_asset_id}/frames/{sequence}"
+    ]["put"]
+    assert frame_operation["security"] == [{"HTTPBasic": []}]
+    assert {
+        parameter["name"]: (parameter["in"], parameter["required"])
+        for parameter in frame_operation["parameters"]
+    } == {
+        "audio_asset_id": ("path", True),
+        "sequence": ("path", True),
+        "X-Frame-Start-Ms": ("header", True),
+        "X-Frame-End-Ms": ("header", True),
+    }
+    frame_schema = frame_operation["requestBody"]["content"][
+        "audio/webm;codecs=opus"
+    ]["schema"]
+    assert frame_schema == {
+        "type": "string",
+        "format": "binary",
+        "minLength": 1,
+        "maxLength": 2 * 1024 * 1024,
+    }
+    assert {"200", "401", "404", "409", "413", "415", "422", "503"} <= set(
+        frame_operation["responses"]
+    )
+    for status_code in ("401", "404", "409", "413", "415", "422", "503"):
+        assert (
+            "application/problem+json"
+            in frame_operation["responses"][status_code]["content"]
+        )
 
 
 def test_busy_mutation_returns_retryable_problem_details(
     database_path: Path,
     client: TestClient,
 ) -> None:
+    project = create_project(client)
+    section, _response = create_section(client, project["id"])
     lock = sqlite3.connect(database_path, isolation_level=None)
     lock.execute("BEGIN IMMEDIATE")
     try:
-        response = client.post(
-            "/api/v1/projects",
-            json={"idempotencyKey": str(uuid4()), "title": "Busy"},
-            auth=auth(),
-        )
+        responses = [
+            client.post(
+                "/api/v1/projects",
+                json={"idempotencyKey": str(uuid4()), "title": "Busy"},
+                auth=auth(),
+            ),
+            upload_frame(client, section["audioAssetId"], 0),
+        ]
     finally:
         lock.rollback()
         lock.close()
 
-    assert response.status_code == 503
-    assert response.headers["content-type"] == "application/problem+json"
-    assert response.json()["code"] == "database_busy"
-    assert "retry-after" not in response.headers
+    for response in responses:
+        assert response.status_code == 503
+        assert response.headers["content-type"] == "application/problem+json"
+        assert response.json()["code"] == "database_busy"
+        assert "retry-after" not in response.headers
+
+
+def test_failed_frame_transaction_is_not_acknowledged_and_can_be_retried(
+    database_path: Path,
+) -> None:
+    app = create_app(settings_for(database_path))
+    with TestClient(app, raise_server_exceptions=False) as test_client:
+        project = create_project(test_client)
+        section, _response = create_section(test_client, project["id"])
+        with sqlite3.connect(database_path) as connection:
+            connection.execute(
+                """
+                CREATE TRIGGER reject_test_frame
+                BEFORE INSERT ON transport_frames
+                BEGIN
+                    SELECT RAISE(ABORT, 'injected frame failure');
+                END
+                """
+            )
+
+        failed = upload_frame(test_client, section["audioAssetId"], 0)
+
+        with sqlite3.connect(database_path) as connection:
+            connection.execute("DROP TRIGGER reject_test_frame")
+        retry = upload_frame(test_client, section["audioAssetId"], 0)
+        replay = upload_frame(test_client, section["audioAssetId"], 0)
+        detail = test_client.get(f"/api/v1/projects/{project['id']}", auth=auth())
+
+    assert failed.status_code == 500
+    assert retry.status_code == 200
+    assert replay.status_code == 200
+    asset = detail.json()["document"]["sections"][0]["audioAsset"]
+    assert asset["frameCount"] == 1
+    assert asset["storedBytes"] == 9

@@ -4,6 +4,8 @@ from pathlib import Path
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+DEFAULT_MAX_TRANSPORT_FRAME_BYTES = 2 * 1024 * 1024
+
 
 class AppEnvironment(StrEnum):
     DEVELOPMENT = "development"
@@ -78,6 +80,11 @@ class Settings(BasicIdentitySettings):
     )
     server_host: str = Field(default="0.0.0.0", validation_alias="SERVER_HOST")
     server_port: int = Field(default=8000, ge=1, le=65_535, validation_alias="SERVER_PORT")
+    max_transport_frame_bytes: int = Field(
+        default=DEFAULT_MAX_TRANSPORT_FRAME_BYTES,
+        gt=0,
+        validation_alias="MAX_TRANSPORT_FRAME_BYTES",
+    )
 
     @field_validator("allowed_origins")
     @classmethod
