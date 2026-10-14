@@ -1,3 +1,4 @@
+import hashlib
 import re
 import sqlite3
 import unicodedata
@@ -35,6 +36,10 @@ class IdempotencyKeyReused(Exception):
 
 
 class AudioAssetSealConflict(Exception):
+    pass
+
+
+class FrameConflict(Exception):
     pass
 
 
@@ -84,6 +89,13 @@ class SectionCreation:
     section_id: UUID
     audio_asset_id: UUID
     position: int
+
+
+@dataclass(frozen=True)
+class FrameAcknowledgement:
+    sequence: int
+    sha256: str
+    next_expected_sequence: int
 
 
 @dataclass(frozen=True)
@@ -411,6 +423,104 @@ class ProjectStorage:
             reason="interrupted",
             frame_count=None,
         )
+
+    def accept_audio_frame(
+        self,
+        owner_id: UUID,
+        audio_asset_id: UUID,
+        *,
+        sequence: int,
+        start_ms: int,
+        end_ms: int,
+        media_type: str,
+        payload: bytes,
+    ) -> FrameAcknowledgement:
+        media_type = canonicalize_media_type(media_type)
+        frame_sha256 = hashlib.sha256(payload).hexdigest()
+        with self._transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    audio_assets.is_sealed,
+                    audio_assets.next_expected_sequence,
+                    audio_assets.observed_duration_ms,
+                    projects.id AS project_id,
+                    projects.created_at_ms
+                FROM audio_assets
+                JOIN sections ON sections.id = audio_assets.section_id
+                JOIN projects ON projects.id = sections.project_id
+                WHERE audio_assets.id = ? AND projects.owner_id = ?
+                """,
+                (str(audio_asset_id), str(owner_id)),
+            ).fetchone()
+            if row is None:
+                raise ResourceNotFound
+            next_expected_sequence = row["next_expected_sequence"]
+            if sequence < next_expected_sequence:
+                stored = connection.execute(
+                    """
+                    SELECT start_ms, end_ms, media_type, sha256
+                    FROM transport_frames
+                    WHERE audio_asset_id = ? AND sequence = ?
+                    """,
+                    (str(audio_asset_id), sequence),
+                ).fetchone()
+                if (
+                    stored is None
+                    or stored["start_ms"] != start_ms
+                    or stored["end_ms"] != end_ms
+                    or stored["media_type"] != media_type
+                    or stored["sha256"] != frame_sha256
+                ):
+                    raise FrameConflict
+                return FrameAcknowledgement(
+                    sequence=sequence,
+                    sha256=frame_sha256,
+                    next_expected_sequence=next_expected_sequence,
+                )
+            if row["is_sealed"] or sequence > next_expected_sequence:
+                raise FrameConflict
+            if start_ms != row["observed_duration_ms"]:
+                raise FrameConflict
+
+            connection.execute(
+                """
+                INSERT INTO transport_frames (
+                    audio_asset_id, sequence, start_ms, end_ms,
+                    media_type, sha256, payload
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(audio_asset_id),
+                    sequence,
+                    start_ms,
+                    end_ms,
+                    media_type,
+                    frame_sha256,
+                    payload,
+                ),
+            )
+            next_expected_sequence += 1
+            connection.execute(
+                """
+                UPDATE audio_assets
+                SET next_expected_sequence = ?,
+                    observed_duration_ms = ?,
+                    stored_bytes = stored_bytes + ?
+                WHERE id = ?
+                """,
+                (next_expected_sequence, end_ms, len(payload), str(audio_asset_id)),
+            )
+            updated_at_ms = max(self._clock_ms(), row["created_at_ms"])
+            connection.execute(
+                "UPDATE projects SET updated_at_ms = ? WHERE id = ?",
+                (updated_at_ms, row["project_id"]),
+            )
+            return FrameAcknowledgement(
+                sequence=sequence,
+                sha256=frame_sha256,
+                next_expected_sequence=next_expected_sequence,
+            )
 
     def _seal_audio_asset(
         self,

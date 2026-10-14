@@ -13,6 +13,8 @@ from the Whisper service in `../inference`.
 available only in development and test. `AUTH_MODE=auth0` deliberately fails at
 startup until backend issue #8 supplies the production adapter. CORS origins and
 Basic usernames are JSON arrays. CORS wildcards are rejected.
+`MAX_TRANSPORT_FRAME_BYTES` bounds each streamed audio frame and defaults to
+2097152 bytes (2 MiB).
 
 ## Docker Compose workflow
 

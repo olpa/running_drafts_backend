@@ -17,6 +17,7 @@ from running_drafts.project_storage import (
     AudioAssetSealConflict,
     DatabaseBusy,
     DatabaseUnavailable,
+    FrameConflict,
     IdempotencyKeyReused,
     ResourceNotFound,
 )
@@ -105,6 +106,15 @@ def create_app(settings: Settings) -> FastAPI:
             title="Audio asset seal conflict",
             detail="The audio asset cannot be sealed with this command.",
             code="audio_asset_seal_conflict",
+        )
+
+    @app.exception_handler(FrameConflict)
+    def handle_frame_conflict(_request: Request, _error: FrameConflict) -> JSONResponse:
+        return problem_response(
+            status=409,
+            title="Audio frame conflict",
+            detail="The audio frame conflicts with the current asset state.",
+            code="frame_conflict",
         )
 
     @app.exception_handler(DatabaseBusy)
