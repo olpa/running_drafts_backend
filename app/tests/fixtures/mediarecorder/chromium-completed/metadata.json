@@ -1,0 +1,68 @@
+{
+  "browser": "chromium",
+  "browserVersion": "153.0.8010.12",
+  "delayedAtMs": 10502,
+  "frames": [
+    {
+      "bytes": 143651,
+      "emittedAtMs": 10506,
+      "file": "frame-000.webm",
+      "mediaType": "audio/webm;codecs=opus",
+      "sequence": 0,
+      "sha256": "38086402dee6c1ae86d01db527bd8e3fe63f2ab7e707beeb70dcd0141b565f0c"
+    },
+    {
+      "bytes": 163115,
+      "emittedAtMs": 20524,
+      "file": "frame-001.webm",
+      "mediaType": "audio/webm;codecs=opus",
+      "sequence": 1,
+      "sha256": "e228ad8146cd1c7583f04590c7a5aa10cfaba03a96bb5e54199b717d777e6fa3"
+    },
+    {
+      "bytes": 16421,
+      "emittedAtMs": 21504,
+      "file": "frame-002.webm",
+      "mediaType": "audio/webm;codecs=opus",
+      "sequence": 2,
+      "sha256": "445dfbfa4e2c4e8419e3e557a3063dd35920729ad1e6a41899e515330c422c27"
+    }
+  ],
+  "inputSource": "speech-en.riff",
+  "inputTrackSettings": {
+    "autoGainControl": false,
+    "channelCount": 2,
+    "deviceId": "default",
+    "echoCancellation": false,
+    "groupId": "3e7d053bb9eff571c28c8109b16ba516238e1b30ad7ac9ef611af0e6b6a48547",
+    "latency": 0.01,
+    "noiseSuppression": false,
+    "sampleRate": 44100,
+    "sampleSize": 16,
+    "voiceIsolation": false
+  },
+  "joined": {
+    "bytes": 323187,
+    "decoded": {
+      "channels": 1,
+      "codec": "opus",
+      "decodedDurationSeconds": 21.48,
+      "decodedSamplesPerChannel": 1031040,
+      "sampleRate": 48000
+    },
+    "file": "joined.webm",
+    "sha256": "483b12fb040f75cf4f229fdea74c4889ee4348ca99f708a8950db493c7d55a39"
+  },
+  "mediaType": "audio/webm;codecs=opus",
+  "observedDurationMs": 21507,
+  "recorderTrackSettings": {
+    "channelCount": 1,
+    "deviceId": "WebAudio-e65a4fdd-5cdf-4c99-8e1b-b9fb1f2d159e",
+    "latency": 0.01,
+    "sampleRate": 44100,
+    "sampleSize": 16
+  },
+  "requestedDurationMs": 21500,
+  "requestedTimesliceMs": 10000,
+  "sealReason": "completed"
+}

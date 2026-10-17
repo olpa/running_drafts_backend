@@ -1,0 +1,60 @@
+{
+  "browser": "chromium",
+  "browserVersion": "153.0.8010.12",
+  "delayedAtMs": 10501,
+  "frames": [
+    {
+      "bytes": 143651,
+      "emittedAtMs": 10507,
+      "file": "frame-000.webm",
+      "mediaType": "audio/webm;codecs=opus",
+      "sequence": 0,
+      "sha256": "c76bc834f7847ab1d3ddcb95bb834d3093eb2e855288067d6aee1071241b3681"
+    },
+    {
+      "bytes": 23276,
+      "emittedAtMs": 11518,
+      "file": "frame-001.webm",
+      "mediaType": "audio/webm;codecs=opus",
+      "sequence": 1,
+      "sha256": "934cb5d94c86f85d3657787e66127d2ccb9e160e9cf8debfd51d13455d5d0427"
+    }
+  ],
+  "inputSource": "speech-en.riff",
+  "inputTrackSettings": {
+    "autoGainControl": false,
+    "channelCount": 2,
+    "deviceId": "default",
+    "echoCancellation": false,
+    "groupId": "ee5d2b96d6d4566c7678e9116a83cd9b51135ae8fc46cfcf09cf955b67a93284",
+    "latency": 0.01,
+    "noiseSuppression": false,
+    "sampleRate": 44100,
+    "sampleSize": 16,
+    "voiceIsolation": false
+  },
+  "joined": {
+    "bytes": 166927,
+    "decoded": {
+      "channels": 1,
+      "codec": "opus",
+      "decodedDurationSeconds": 11.46,
+      "decodedSamplesPerChannel": 550080,
+      "sampleRate": 48000
+    },
+    "file": "joined.webm",
+    "sha256": "8532ef70a4725da2ffa4c20a7f637311682f5a1e1df578d859c55a517000e3cb"
+  },
+  "mediaType": "audio/webm;codecs=opus",
+  "observedDurationMs": 11523,
+  "recorderTrackSettings": {
+    "channelCount": 1,
+    "deviceId": "WebAudio-6504ce72-26c5-406b-a1a6-74277d7d28f3",
+    "latency": 0.01,
+    "sampleRate": 44100,
+    "sampleSize": 16
+  },
+  "requestedDurationMs": 11500,
+  "requestedTimesliceMs": 10000,
+  "sealReason": "interrupted"
+}

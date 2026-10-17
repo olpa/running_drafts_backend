@@ -1,0 +1,50 @@
+{
+  "browser": "firefox",
+  "browserVersion": "155.0",
+  "delayedAtMs": 10502,
+  "frames": [
+    {
+      "bytes": 6507,
+      "emittedAtMs": 10503,
+      "file": "frame-000.webm",
+      "mediaType": "audio/webm;codecs=opus",
+      "sequence": 0,
+      "sha256": "f1c7c60da013e03d82cd2709cb81261520615eefb79ebd543c6fed6621b33764"
+    },
+    {
+      "bytes": 856,
+      "emittedAtMs": 11513,
+      "file": "frame-001.webm",
+      "mediaType": "audio/webm;codecs=opus",
+      "sequence": 1,
+      "sha256": "323872579a16ae7ba82048cd3ecef67bf35a8196cb2beeec2a77959bada86ce2"
+    }
+  ],
+  "inputSource": "Playwright Firefox fake microphone",
+  "inputTrackSettings": {
+    "autoGainControl": false,
+    "channelCount": 1,
+    "deviceId": "v9LJbv7IkBJToIaritP9Evqs9I6LwXyc2tzUDQssv4Q=",
+    "echoCancellation": false,
+    "groupId": "hgtJnln0waN9NBY1kgOj2AO7b5SMUfS8BV0LgWRxRNo=",
+    "noiseSuppression": false
+  },
+  "joined": {
+    "bytes": 7363,
+    "decoded": {
+      "channels": 1,
+      "codec": "opus",
+      "decodedDurationSeconds": 11.5135,
+      "decodedSamplesPerChannel": 552648,
+      "sampleRate": 48000
+    },
+    "file": "joined.webm",
+    "sha256": "b731db86d8809ef263a43e84161b4cf56c9f0c0fff31c2d12f308436c2ce339e"
+  },
+  "mediaType": "audio/webm;codecs=opus",
+  "observedDurationMs": 11523,
+  "recorderTrackSettings": {},
+  "requestedDurationMs": 11500,
+  "requestedTimesliceMs": 10000,
+  "sealReason": "interrupted"
+}

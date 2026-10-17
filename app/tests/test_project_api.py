@@ -473,6 +473,7 @@ def test_zero_frame_sealing_is_idempotent_and_conflicts_are_stable(
     assert completed.json()["isSealed"] is True
     assert completed.json()["sealReason"] == "completed"
     assert completed.json()["frameCount"] == 0
+    assert completed.json()["storedBytes"] == 0
     assert replay.json() == completed.json()
     for conflict in (changed_count, opposite):
         assert conflict.status_code == 409
