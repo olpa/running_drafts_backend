@@ -1,0 +1,25 @@
+{
+  "sourceCommit": "566520e1d0dfc4d74492686195c7670b457f9fbd",
+  "sourcePath": "e2e/fixtures/mediarecorder",
+  "sourceRepository": "https://github.com/olpa/running_drafts_product",
+  "files": {
+    "chromium-completed/frame-000.webm": "38086402dee6c1ae86d01db527bd8e3fe63f2ab7e707beeb70dcd0141b565f0c",
+    "chromium-completed/frame-001.webm": "e228ad8146cd1c7583f04590c7a5aa10cfaba03a96bb5e54199b717d777e6fa3",
+    "chromium-completed/frame-002.webm": "445dfbfa4e2c4e8419e3e557a3063dd35920729ad1e6a41899e515330c422c27",
+    "chromium-completed/joined.webm": "483b12fb040f75cf4f229fdea74c4889ee4348ca99f708a8950db493c7d55a39",
+    "chromium-completed/metadata.json": "fc48d72a135171b17b035c4aa0b0faaab17ee0c04b844b512965abd9da0a598a",
+    "chromium-interrupted/frame-000.webm": "c76bc834f7847ab1d3ddcb95bb834d3093eb2e855288067d6aee1071241b3681",
+    "chromium-interrupted/frame-001.webm": "934cb5d94c86f85d3657787e66127d2ccb9e160e9cf8debfd51d13455d5d0427",
+    "chromium-interrupted/joined.webm": "8532ef70a4725da2ffa4c20a7f637311682f5a1e1df578d859c55a517000e3cb",
+    "chromium-interrupted/metadata.json": "30ec59206db1bb88e1f5e4f068ea95a79740cef0f42b72a17852e7805bdebff5",
+    "firefox-completed/frame-000.webm": "2c1931caf584b26e4aa0ddc7c65bb3ace6bff4dea31fc92f52792e67fa6aaa76",
+    "firefox-completed/frame-001.webm": "d603e8296541424f524fb6bfbe8ac52b8ddf08a8a303f44c4719864d2f65f18d",
+    "firefox-completed/frame-002.webm": "8f2bcbf20190ceb8d525deab46804713890c13efb394243785955fb0962fe851",
+    "firefox-completed/joined.webm": "9118422a21c40743f8ab738e464659ed17dd49343ab4c1ffba14bdab793e83df",
+    "firefox-completed/metadata.json": "33d17de617f2a25fa3f63d91549d84ab172d42532be8e75f59ba0e904df0aa0b",
+    "firefox-interrupted/frame-000.webm": "f1c7c60da013e03d82cd2709cb81261520615eefb79ebd543c6fed6621b33764",
+    "firefox-interrupted/frame-001.webm": "323872579a16ae7ba82048cd3ecef67bf35a8196cb2beeec2a77959bada86ce2",
+    "firefox-interrupted/joined.webm": "b731db86d8809ef263a43e84161b4cf56c9f0c0fff31c2d12f308436c2ce339e",
+    "firefox-interrupted/metadata.json": "ecf1689d941f160e7e601835bbabfdab03799377e0f163a3d4ed2d061034e1ef"
+  }
+}

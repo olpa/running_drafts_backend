@@ -1,0 +1,27 @@
+{
+  "durationToleranceSeconds": 0.75,
+  "cases": {
+    "chromium-completed": {
+      "decodedPcmS16leSha256": "c8c1e5beb4f00cc1130f733ae528ec69b08f3e6a0a597d19ebcfb32f3b5a5d4f",
+      "decodedSamplesPerChannel": 1031040,
+      "maximumNearSilentRunSamples": 24725,
+      "minimumTail100msRms": 30.0
+    },
+    "chromium-interrupted": {
+      "decodedPcmS16leSha256": "beb1ba5e6bad0b3afaaaf9fd92332019555437a3144cff8dca8d75219fb5124b",
+      "decodedSamplesPerChannel": 550080,
+      "maximumNearSilentRunSamples": 24725,
+      "minimumTail100msRms": 30.0
+    },
+    "firefox-completed": {
+      "decodedPcmS16leSha256": "81b47fa316fcfda7f9bbe679c9477c8cd00b32ec5313985d7250126e8585660e",
+      "decodedSamplesPerChannel": 1056648,
+      "expectedSignal": "silence"
+    },
+    "firefox-interrupted": {
+      "decodedPcmS16leSha256": "58f83955003915a39cd4d5608dbcb220bd0e5ab996e212cb11671601e7a5ccae",
+      "decodedSamplesPerChannel": 552648,
+      "expectedSignal": "silence"
+    }
+  }
+}

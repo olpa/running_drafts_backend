@@ -1,0 +1,58 @@
+{
+  "browser": "firefox",
+  "browserVersion": "155.0",
+  "delayedAtMs": 10501,
+  "frames": [
+    {
+      "bytes": 6519,
+      "emittedAtMs": 10501,
+      "file": "frame-000.webm",
+      "mediaType": "audio/webm;codecs=opus",
+      "sequence": 0,
+      "sha256": "2c1931caf584b26e4aa0ddc7c65bb3ace6bff4dea31fc92f52792e67fa6aaa76"
+    },
+    {
+      "bytes": 6063,
+      "emittedAtMs": 19997,
+      "file": "frame-001.webm",
+      "mediaType": "audio/webm;codecs=opus",
+      "sequence": 1,
+      "sha256": "d603e8296541424f524fb6bfbe8ac52b8ddf08a8a303f44c4719864d2f65f18d"
+    },
+    {
+      "bytes": 1263,
+      "emittedAtMs": 22005,
+      "file": "frame-002.webm",
+      "mediaType": "audio/webm;codecs=opus",
+      "sequence": 2,
+      "sha256": "8f2bcbf20190ceb8d525deab46804713890c13efb394243785955fb0962fe851"
+    }
+  ],
+  "inputSource": "Playwright Firefox fake microphone",
+  "inputTrackSettings": {
+    "autoGainControl": false,
+    "channelCount": 1,
+    "deviceId": "fiMDMyCWrOKDXsDaNx6aeAYEvwKLY/e/DMqeFcm2UF0=",
+    "echoCancellation": false,
+    "groupId": "bCFzkx5NPx/jqPWr47dsoFGHxBUg7d7Yv448S1G/Imk=",
+    "noiseSuppression": false
+  },
+  "joined": {
+    "bytes": 13845,
+    "decoded": {
+      "channels": 1,
+      "codec": "opus",
+      "decodedDurationSeconds": 22.0135,
+      "decodedSamplesPerChannel": 1056648,
+      "sampleRate": 48000
+    },
+    "file": "joined.webm",
+    "sha256": "9118422a21c40743f8ab738e464659ed17dd49343ab4c1ffba14bdab793e83df"
+  },
+  "mediaType": "audio/webm;codecs=opus",
+  "observedDurationMs": 22016,
+  "recorderTrackSettings": {},
+  "requestedDurationMs": 21500,
+  "requestedTimesliceMs": 10000,
+  "sealReason": "completed"
+}

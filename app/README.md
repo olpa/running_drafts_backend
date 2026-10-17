@@ -6,6 +6,7 @@ from the Whisper service in `../inference`.
 ## Requirements
 
 - Docker with Compose, or Python 3.15 and `uv`
+- FFmpeg and FFprobe for the browser WebM/Opus evidence tests
 - Explicit configuration; copy `.env.example` to `.env` and replace the
   development password before using Compose
 
@@ -83,3 +84,6 @@ smoke test with:
 ```bash
 RUN_CONTAINER_TESTS=1 uv run pytest -m container
 ```
+
+The real-browser ordered WebM assembly evidence and deterministic empty-audio
+fixture are documented in [`../docs/webm-assembly-evidence.md`](../docs/webm-assembly-evidence.md).
