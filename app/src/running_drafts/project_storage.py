@@ -1,13 +1,16 @@
+import errno
 import hashlib
 import re
 import sqlite3
+import tempfile
 import unicodedata
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from importlib.resources import files
 from pathlib import Path
-from typing import Literal
+from typing import BinaryIO, Literal
 from uuid import UUID, uuid4
 
 from running_drafts.database import DatabaseConfigurationError, existing_connection
@@ -36,6 +39,40 @@ class IdempotencyKeyReused(Exception):
 
 
 class AudioAssetSealConflict(Exception):
+    pass
+
+
+class AudioAssetNotSealed(Exception):
+    pass
+
+
+class AudioAssemblyFailure(Exception):
+    def __init__(
+        self,
+        audio_asset_id: UUID,
+        *,
+        expected_frame_count: int,
+        actual_frame_count: int,
+        expected_bytes: int,
+        actual_bytes: int,
+        offending_sequence: int | None,
+        nearby_hashes: tuple[str, ...],
+    ) -> None:
+        super().__init__("stored audio frames do not match asset accounting")
+        self.audio_asset_id = audio_asset_id
+        self.expected_frame_count = expected_frame_count
+        self.actual_frame_count = actual_frame_count
+        self.expected_bytes = expected_bytes
+        self.actual_bytes = actual_bytes
+        self.offending_sequence = offending_sequence
+        self.nearby_hashes = nearby_hashes
+
+
+class DownloadStorageUnavailable(Exception):
+    pass
+
+
+class TemporaryFileFailure(RuntimeError):
     pass
 
 
@@ -99,6 +136,15 @@ class FrameAcknowledgement:
 
 
 @dataclass(frozen=True)
+class StagedAudioDownload:
+    stream: BinaryIO
+    project_title: str
+    section_position: int
+    seal_reason: SealReason
+    content_length: int
+
+
+@dataclass(frozen=True)
 class CreationResult[T]:
     value: T
     created: bool
@@ -143,6 +189,36 @@ def _now_ms() -> int:
     return int(datetime.now(UTC).timestamp() * 1_000)
 
 
+def _temporary_file() -> BinaryIO:
+    return tempfile.TemporaryFile(mode="w+b")
+
+
+def _raise_temporary_file_error(error: OSError) -> None:
+    if error.errno in {errno.ENOSPC, errno.EDQUOT}:
+        raise DownloadStorageUnavailable from error
+    raise TemporaryFileFailure from error
+
+
+def _assembly_failure(
+    audio_asset_id: UUID,
+    asset: sqlite3.Row,
+    *,
+    actual_frame_count: int,
+    actual_bytes: int,
+    offending_sequence: int | None,
+    nearby_hashes: tuple[str, ...],
+) -> AudioAssemblyFailure:
+    return AudioAssemblyFailure(
+        audio_asset_id,
+        expected_frame_count=asset["next_expected_sequence"],
+        actual_frame_count=actual_frame_count,
+        expected_bytes=asset["stored_bytes"],
+        actual_bytes=actual_bytes,
+        offending_sequence=offending_sequence,
+        nearby_hashes=nearby_hashes,
+    )
+
+
 def _is_busy(error: sqlite3.OperationalError) -> bool:
     code = getattr(error, "sqlite_errorcode", None)
     return code is not None and code & 0xFF in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
@@ -156,11 +232,13 @@ class ProjectStorage:
         busy_timeout_ms: int,
         clock_ms: Callable[[], int] = _now_ms,
         new_id: Callable[[], UUID] = uuid4,
+        temporary_file_factory: Callable[[], BinaryIO] = _temporary_file,
     ) -> None:
         self._database_path = database_path
         self._busy_timeout_ms = busy_timeout_ms
         self._clock_ms = clock_ms
         self._new_id = new_id
+        self._temporary_file_factory = temporary_file_factory
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -603,6 +681,127 @@ class ProjectStorage:
                 """,
                 (str(owner_id),),
             ).fetchone()[0]
+
+    def stage_audio_download(
+        self,
+        owner_id: UUID,
+        audio_asset_id: UUID,
+    ) -> StagedAudioDownload:
+        with self._connection() as connection:
+            connection.execute("BEGIN")
+            asset = connection.execute(
+                """
+                SELECT
+                    projects.title,
+                    sections.position,
+                    audio_assets.is_sealed,
+                    audio_assets.seal_reason,
+                    audio_assets.next_expected_sequence,
+                    audio_assets.stored_bytes
+                FROM audio_assets
+                JOIN sections ON sections.id = audio_assets.section_id
+                JOIN projects ON projects.id = sections.project_id
+                WHERE audio_assets.id = ? AND projects.owner_id = ?
+                """,
+                (str(audio_asset_id), str(owner_id)),
+            ).fetchone()
+            if asset is None:
+                raise ResourceNotFound
+            if not asset["is_sealed"]:
+                raise AudioAssetNotSealed
+
+            if asset["next_expected_sequence"] == 0:
+                if asset["stored_bytes"] != 0:
+                    raise _assembly_failure(
+                        audio_asset_id,
+                        asset,
+                        actual_frame_count=0,
+                        actual_bytes=0,
+                        offending_sequence=None,
+                        nearby_hashes=(),
+                    )
+                staged = files("running_drafts").joinpath("assets/empty-audio.webm").open("rb")
+                staged.seek(0, 2)
+                content_length = staged.tell()
+                staged.seek(0)
+                connection.commit()
+                return StagedAudioDownload(
+                    stream=staged,
+                    project_title=asset["title"],
+                    section_position=asset["position"],
+                    seal_reason=asset["seal_reason"],
+                    content_length=content_length,
+                )
+
+            try:
+                staged = self._temporary_file_factory()
+            except OSError as error:
+                _raise_temporary_file_error(error)
+            try:
+                actual_frame_count = 0
+                actual_bytes = 0
+                offending_sequence = None
+                nearby_hashes: list[str] = []
+                for row in connection.execute(
+                    """
+                    SELECT sequence, sha256, payload
+                    FROM transport_frames
+                    WHERE audio_asset_id = ?
+                    ORDER BY sequence
+                    """,
+                    (str(audio_asset_id),),
+                ):
+                    if offending_sequence is None:
+                        nearby_hashes.append(row["sha256"])
+                        if len(nearby_hashes) > 3:
+                            nearby_hashes.pop(0)
+                        if row["sequence"] != actual_frame_count:
+                            offending_sequence = row["sequence"]
+                    actual_frame_count += 1
+                    actual_bytes += len(row["payload"])
+                    staged.write(row["payload"])
+                if (
+                    offending_sequence is not None
+                    or actual_frame_count != asset["next_expected_sequence"]
+                    or actual_bytes != asset["stored_bytes"]
+                    or actual_bytes == 0
+                ):
+                    raise _assembly_failure(
+                        audio_asset_id,
+                        asset,
+                        actual_frame_count=actual_frame_count,
+                        actual_bytes=actual_bytes,
+                        offending_sequence=offending_sequence,
+                        nearby_hashes=tuple(nearby_hashes),
+                    )
+                staged.flush()
+                content_length = staged.tell()
+                if content_length != asset["stored_bytes"]:
+                    raise _assembly_failure(
+                        audio_asset_id,
+                        asset,
+                        actual_frame_count=actual_frame_count,
+                        actual_bytes=content_length,
+                        offending_sequence=None,
+                        nearby_hashes=tuple(nearby_hashes),
+                    )
+                staged.seek(0)
+                connection.commit()
+            except OSError as error:
+                with suppress(OSError):
+                    staged.close()
+                _raise_temporary_file_error(error)
+            except BaseException:
+                staged.close()
+                raise
+
+        return StagedAudioDownload(
+            stream=staged,
+            project_title=asset["title"],
+            section_position=asset["position"],
+            seal_reason=asset["seal_reason"],
+            content_length=content_length,
+        )
 
 
 def _project_summary(row: sqlite3.Row) -> ProjectSummary:

@@ -1,10 +1,18 @@
+import asyncio
+import base64
+import errno
 import json
 import os
 import sqlite3
 import subprocess
 import sys
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
+from importlib.resources import files
 from pathlib import Path
+from tempfile import TemporaryFile
+from threading import Event, Lock
+from urllib.parse import quote, unquote
 from uuid import UUID, uuid4
 
 import pytest
@@ -16,6 +24,7 @@ from running_drafts.project_storage import ProjectStorage
 from running_drafts.settings import AppEnvironment, AuthMode, Settings
 
 PASSWORD = "shared-password"
+MEDIARECORDER_FIXTURES = Path(__file__).parent / "fixtures" / "mediarecorder"
 
 
 def run_admin(command: str, database_path: Path) -> subprocess.CompletedProcess[str]:
@@ -482,6 +491,556 @@ def test_zero_frame_sealing_is_idempotent_and_conflicts_are_stable(
     assert interrupted_replay.json() == interrupted.json()
 
 
+def test_sealed_audio_download_returns_exact_ordered_frames(client: TestClient) -> None:
+    project = create_project(client, title="October Notes")
+    section, _response = create_section(client, project["id"])
+    asset_id = section["audioAssetId"]
+    assert upload_frame(client, asset_id, 0, payload=b"frame-one").status_code == 200
+    assert (
+        upload_frame(
+            client,
+            asset_id,
+            1,
+            payload=b"frame-two",
+            start_ms=1_000,
+            end_ms=2_000,
+        ).status_code
+        == 200
+    )
+    sealed = client.post(
+        f"/api/v1/audio-assets/{asset_id}/complete",
+        json={"frameCount": 2},
+        auth=auth(),
+    )
+    assert sealed.status_code == 200
+
+    downloaded = client.get(
+        f"/api/v1/audio-assets/{asset_id}/download",
+        auth=auth(),
+    )
+
+    assert downloaded.status_code == 200
+    assert downloaded.content == b"frame-oneframe-two"
+    assert downloaded.headers["content-type"] == "audio/webm;codecs=opus"
+    assert downloaded.headers["content-length"] == "18"
+    assert downloaded.headers["content-disposition"] == (
+        'attachment; filename="October-Notes-section-1.webm"; '
+        "filename*=UTF-8''October-Notes-section-1.webm"
+    )
+
+
+def test_audio_download_requires_authentication_ownership_and_sealing(
+    client: TestClient,
+) -> None:
+    project = create_project(client)
+    section, _response = create_section(client, project["id"])
+    endpoint = f"/api/v1/audio-assets/{section['audioAssetId']}/download"
+
+    unauthenticated = client.get(endpoint)
+    open_asset = client.get(endpoint, auth=auth())
+    unowned = client.get(endpoint, auth=auth("Bob"))
+    missing = client.get(f"/api/v1/audio-assets/{uuid4()}/download", auth=auth("Bob"))
+
+    assert unauthenticated.status_code == 401
+    assert open_asset.status_code == 409
+    assert open_asset.json()["code"] == "asset_not_sealed"
+    assert unowned.status_code == 404
+    assert unowned.content == missing.content
+
+
+def test_zero_frame_download_uses_empty_fixture_and_unicode_filename(
+    database_path: Path,
+    client: TestClient,
+) -> None:
+    project = create_project(client, title="Žlutý 東京 / Notes 🎙️")
+    completed, _response = create_section(client, project["id"])
+    sealed = client.post(
+        f"/api/v1/audio-assets/{completed['audioAssetId']}/complete",
+        json={"frameCount": 0},
+        auth=auth(),
+    )
+    assert sealed.status_code == 200
+
+    def unexpected_temporary_file():
+        raise AssertionError("zero-frame downloads must not create a temporary file")
+
+    direct_fixture_storage = ProjectStorage(
+        database_path,
+        busy_timeout_ms=100,
+        temporary_file_factory=unexpected_temporary_file,
+    )
+    client.app.dependency_overrides[project_storage] = lambda: direct_fixture_storage
+    try:
+        downloaded = client.get(
+            f"/api/v1/audio-assets/{completed['audioAssetId']}/download",
+            auth=auth(),
+            headers={"Origin": "https://editor.test"},
+        )
+    finally:
+        client.app.dependency_overrides.pop(project_storage)
+
+    expected_name = "Žlutý-東京-Notes-section-1.webm"
+    expected_bytes = files("running_drafts").joinpath("assets/empty-audio.webm").read_bytes()
+    assert downloaded.status_code == 200
+    assert downloaded.content == expected_bytes
+    assert downloaded.headers["content-length"] == str(len(expected_bytes))
+    assert downloaded.headers["content-disposition"] == (
+        'attachment; filename="download-section-1.webm"; '
+        f"filename*=UTF-8''{quote(expected_name)}"
+    )
+    assert downloaded.headers["cache-control"] == "private, no-store"
+    assert downloaded.headers["x-content-type-options"] == "nosniff"
+    assert "Content-Disposition" in downloaded.headers["access-control-expose-headers"]
+
+
+def test_download_filename_preserves_suffix_within_utf8_length_limit(
+    client: TestClient,
+) -> None:
+    project = create_project(client, title="界" * 200)
+    section, _response = create_section(client, project["id"])
+    asset_id = section["audioAssetId"]
+    assert (
+        client.post(
+            f"/api/v1/audio-assets/{asset_id}/interrupt",
+            auth=auth(),
+        ).status_code
+        == 200
+    )
+
+    downloaded = client.get(
+        f"/api/v1/audio-assets/{asset_id}/download",
+        auth=auth(),
+    )
+
+    encoded_name = downloaded.headers["content-disposition"].split("filename*=UTF-8''", 1)[1]
+    filename = unquote(encoded_name)
+    assert len(filename.encode()) <= 240
+    assert filename.endswith("-section-1-interrupted.webm")
+    assert filename.startswith("界")
+    assert 'filename="download-section-1-interrupted.webm"' in downloaded.headers[
+        "content-disposition"
+    ]
+
+
+def test_inconsistent_audio_download_returns_bounded_assembly_failure(
+    database_path: Path,
+    client: TestClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    project = create_project(client)
+    section, _response = create_section(client, project["id"])
+    asset_id = section["audioAssetId"]
+    assert upload_frame(client, asset_id, 0, payload=b"frame").status_code == 200
+    assert (
+        client.post(
+            f"/api/v1/audio-assets/{asset_id}/complete",
+            json={"frameCount": 1},
+            auth=auth(),
+        ).status_code
+        == 200
+    )
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "UPDATE audio_assets SET stored_bytes = 999 WHERE id = ?",
+            (asset_id,),
+        )
+
+    with caplog.at_level("ERROR"):
+        response = client.get(
+            f"/api/v1/audio-assets/{asset_id}/download",
+            auth=auth(),
+        )
+
+    assert response.status_code == 500
+    assert response.json()["code"] == "audio_assembly_failed"
+    record = next(
+        record for record in caplog.records if record.msg.startswith("audio assembly failed")
+    )
+    message = record.getMessage()
+    assert f"audio_asset_id={asset_id}" in message
+    assert "expected_bytes=999" in message
+    assert "actual_bytes=5" in message
+    assert message.count("9dff50df08c635815f4b19da10f756605a34a79a48d4ba48712782502975a70e") == 1
+
+
+def test_temporary_disk_exhaustion_returns_storage_unavailable(
+    database_path: Path,
+    client: TestClient,
+) -> None:
+    project = create_project(client)
+    section, _response = create_section(client, project["id"])
+    asset_id = section["audioAssetId"]
+    assert upload_frame(client, asset_id, 0, payload=b"frame").status_code == 200
+    assert (
+        client.post(
+            f"/api/v1/audio-assets/{asset_id}/complete",
+            json={"frameCount": 1},
+            auth=auth(),
+        ).status_code
+        == 200
+    )
+
+    def exhausted_temporary_file():
+        raise OSError(errno.ENOSPC, "injected full temporary disk")
+
+    exhausted_storage = ProjectStorage(
+        database_path,
+        busy_timeout_ms=100,
+        temporary_file_factory=exhausted_temporary_file,
+    )
+    client.app.dependency_overrides[project_storage] = lambda: exhausted_storage
+    try:
+        response = client.get(
+            f"/api/v1/audio-assets/{asset_id}/download",
+            auth=auth(),
+        )
+    finally:
+        client.app.dependency_overrides.pop(project_storage)
+
+    assert response.status_code == 503
+    assert response.json()["code"] == "storage_unavailable"
+
+
+def test_download_capacity_rejects_before_staging_and_returns_after_streaming(
+    database_path: Path,
+    client: TestClient,
+) -> None:
+    project = create_project(client)
+    section, _response = create_section(client, project["id"])
+    asset_id = section["audioAssetId"]
+    assert upload_frame(client, asset_id, 0, payload=b"frame").status_code == 200
+    assert (
+        client.post(
+            f"/api/v1/audio-assets/{asset_id}/complete",
+            json={"frameCount": 1},
+            auth=auth(),
+        ).status_code
+        == 200
+    )
+
+    all_streams_started = Event()
+    allow_streaming = Event()
+    factory_lock = Lock()
+    files_created = 0
+    streams_started = 0
+
+    class BlockingFile:
+        def __init__(self, wrapped) -> None:
+            self.wrapped = wrapped
+            self.started = False
+
+        def read(self, size: int = -1):
+            nonlocal streams_started
+            with factory_lock:
+                if not self.started:
+                    self.started = True
+                    streams_started += 1
+                    if streams_started == 20:
+                        all_streams_started.set()
+            assert allow_streaming.wait(timeout=10)
+            return self.wrapped.read(size)
+
+        def __getattr__(self, name: str):
+            return getattr(self.wrapped, name)
+
+    def temporary_file_factory():
+        nonlocal files_created
+        with factory_lock:
+            files_created += 1
+            should_block = files_created <= 20
+        temporary = TemporaryFile(mode="w+b")  # noqa: SIM115 - response owns the file
+        return BlockingFile(temporary) if should_block else temporary
+
+    settings = settings_for(database_path).model_copy(
+        update={"max_staged_download_files": 20}
+    )
+    app = create_app(settings)
+    app.dependency_overrides[project_storage] = lambda: ProjectStorage(
+        database_path,
+        busy_timeout_ms=100,
+        temporary_file_factory=temporary_file_factory,
+    )
+    endpoint = f"/api/v1/audio-assets/{asset_id}/download"
+    with TestClient(app) as first_client, TestClient(app) as second_client:
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            first_twenty = [
+                executor.submit(first_client.get, endpoint, auth=auth())
+                for _index in range(20)
+            ]
+            assert all_streams_started.wait(timeout=10)
+
+            unauthenticated = second_client.get(endpoint)
+            assert unauthenticated.status_code == 401
+            rejected = second_client.get(
+                f"/api/v1/audio-assets/{uuid4()}/download",
+                auth=auth(),
+            )
+            assert rejected.status_code == 429
+            assert rejected.json()["code"] == "concurrent_download_limit_exceeded"
+            assert "retry-after" not in rejected.headers
+            assert files_created == 20
+
+            allow_streaming.set()
+            assert {request.result(timeout=10).status_code for request in first_twenty} == {
+                200
+            }
+
+        accepted_after_cleanup = second_client.get(endpoint, auth=auth())
+
+    assert accepted_after_cleanup.status_code == 200
+    assert files_created == 21
+
+
+def test_client_disconnect_closes_staged_file_and_releases_capacity(
+    database_path: Path,
+    client: TestClient,
+) -> None:
+    project = create_project(client)
+    section, _response = create_section(client, project["id"])
+    asset_id = section["audioAssetId"]
+    payload = b"x" * (128 * 1024)
+    assert upload_frame(client, asset_id, 0, payload=payload).status_code == 200
+    assert (
+        client.post(
+            f"/api/v1/audio-assets/{asset_id}/complete",
+            json={"frameCount": 1},
+            auth=auth(),
+        ).status_code
+        == 200
+    )
+
+    staged_file_closed = Event()
+    factory_lock = Lock()
+    files_created = 0
+
+    class ObservedFile:
+        def __init__(self, wrapped) -> None:
+            self.wrapped = wrapped
+
+        def close(self) -> None:
+            self.wrapped.close()
+            staged_file_closed.set()
+
+        def __getattr__(self, name: str):
+            return getattr(self.wrapped, name)
+
+    def temporary_file_factory():
+        nonlocal files_created
+        with factory_lock:
+            files_created += 1
+            observe = files_created == 1
+        temporary = TemporaryFile(mode="w+b")  # noqa: SIM115 - response owns the file
+        return ObservedFile(temporary) if observe else temporary
+
+    app = create_app(
+        settings_for(database_path).model_copy(update={"max_staged_download_files": 1})
+    )
+    app.dependency_overrides[project_storage] = lambda: ProjectStorage(
+        database_path,
+        busy_timeout_ms=100,
+        temporary_file_factory=temporary_file_factory,
+    )
+    endpoint = f"/api/v1/audio-assets/{asset_id}/download"
+    credentials = base64.b64encode(f"Alice:{PASSWORD}".encode()).decode()
+
+    async def disconnect_during_stream() -> None:
+        request_sent = False
+        first_body = asyncio.Event()
+
+        async def receive():
+            nonlocal request_sent
+            if not request_sent:
+                request_sent = True
+                return {"type": "http.request", "body": b"", "more_body": False}
+            await first_body.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message) -> None:
+            if message["type"] == "http.response.body" and message.get("body"):
+                first_body.set()
+                await asyncio.Event().wait()
+
+        await app(
+            {
+                "type": "http",
+                "asgi": {"version": "3.0", "spec_version": "2.3"},
+                "http_version": "1.1",
+                "method": "GET",
+                "scheme": "http",
+                "path": endpoint,
+                "raw_path": endpoint.encode(),
+                "query_string": b"",
+                "root_path": "",
+                "headers": [(b"authorization", f"Basic {credentials}".encode())],
+                "client": ("testclient", 123),
+                "server": ("testserver", 80),
+                "state": {},
+            },
+            receive,
+            send,
+        )
+
+    asyncio.run(disconnect_during_stream())
+
+    assert staged_file_closed.wait(timeout=1)
+    with TestClient(app) as retry_client:
+        retry = retry_client.get(endpoint, auth=auth())
+    assert retry.status_code == 200
+
+
+def test_disconnect_before_first_body_closes_file_and_releases_capacity(
+    database_path: Path,
+    client: TestClient,
+) -> None:
+    project = create_project(client)
+    section, _response = create_section(client, project["id"])
+    asset_id = section["audioAssetId"]
+    assert upload_frame(client, asset_id, 0, payload=b"frame").status_code == 200
+    assert (
+        client.post(
+            f"/api/v1/audio-assets/{asset_id}/complete",
+            json={"frameCount": 1},
+            auth=auth(),
+        ).status_code
+        == 200
+    )
+
+    staged_file_closed = Event()
+    staged_file_read = Event()
+
+    class ObservedFile:
+        def __init__(self) -> None:
+            self.wrapped = TemporaryFile(mode="w+b")  # noqa: SIM115 - response owns it
+
+        def read(self, size: int = -1):
+            staged_file_read.set()
+            return self.wrapped.read(size)
+
+        def close(self) -> None:
+            self.wrapped.close()
+            staged_file_closed.set()
+
+        def __getattr__(self, name: str):
+            return getattr(self.wrapped, name)
+
+    files_created = 0
+
+    def temporary_file_factory():
+        nonlocal files_created
+        files_created += 1
+        return ObservedFile() if files_created == 1 else TemporaryFile(mode="w+b")
+
+    app = create_app(
+        settings_for(database_path).model_copy(update={"max_staged_download_files": 1})
+    )
+    app.dependency_overrides[project_storage] = lambda: ProjectStorage(
+        database_path,
+        busy_timeout_ms=100,
+        temporary_file_factory=temporary_file_factory,
+    )
+    endpoint = f"/api/v1/audio-assets/{asset_id}/download"
+    credentials = base64.b64encode(f"Alice:{PASSWORD}".encode()).decode()
+
+    async def disconnect_before_body() -> None:
+        request_sent = False
+        disconnect_returned = asyncio.Event()
+
+        async def receive():
+            nonlocal request_sent
+            if not request_sent:
+                request_sent = True
+                return {"type": "http.request", "body": b"", "more_body": False}
+            disconnect_returned.set()
+            return {"type": "http.disconnect"}
+
+        async def send(message) -> None:
+            if message["type"] == "http.response.start":
+                await disconnect_returned.wait()
+
+        await app(
+            {
+                "type": "http",
+                "asgi": {"version": "3.0", "spec_version": "2.3"},
+                "http_version": "1.1",
+                "method": "GET",
+                "scheme": "http",
+                "path": endpoint,
+                "raw_path": endpoint.encode(),
+                "query_string": b"",
+                "root_path": "",
+                "headers": [(b"authorization", f"Basic {credentials}".encode())],
+                "client": ("testclient", 123),
+                "server": ("testserver", 80),
+                "state": {},
+            },
+            receive,
+            send,
+        )
+
+    asyncio.run(disconnect_before_body())
+
+    assert not staged_file_read.is_set()
+    assert staged_file_closed.wait(timeout=1)
+    with TestClient(app) as retry_client:
+        retry = retry_client.get(endpoint, auth=auth())
+    assert retry.status_code == 200
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "chromium-completed",
+        "chromium-interrupted",
+        "firefox-completed",
+        "firefox-interrupted",
+    ],
+)
+def test_real_browser_audio_download_is_the_exact_joined_stream(
+    client: TestClient,
+    case: str,
+) -> None:
+    fixture = MEDIARECORDER_FIXTURES / case
+    metadata = json.loads((fixture / "metadata.json").read_text())
+    project = create_project(client, title="Browser Evidence")
+    section, _response = create_section(client, project["id"])
+    asset_id = section["audioAssetId"]
+    start_ms = 0
+    for frame in metadata["frames"]:
+        end_ms = start_ms + 1_000
+        uploaded = upload_frame(
+            client,
+            asset_id,
+            frame["sequence"],
+            payload=(fixture / frame["file"]).read_bytes(),
+            start_ms=start_ms,
+            end_ms=end_ms,
+        )
+        assert uploaded.status_code == 200, uploaded.text
+        start_ms = end_ms
+    if metadata["sealReason"] == "completed":
+        sealed = client.post(
+            f"/api/v1/audio-assets/{asset_id}/complete",
+            json={"frameCount": len(metadata["frames"])},
+            auth=auth(),
+        )
+    else:
+        sealed = client.post(
+            f"/api/v1/audio-assets/{asset_id}/interrupt",
+            auth=auth(),
+        )
+    assert sealed.status_code == 200
+
+    downloaded = client.get(
+        f"/api/v1/audio-assets/{asset_id}/download",
+        auth=auth(),
+    )
+
+    assert downloaded.status_code == 200
+    assert downloaded.content == (fixture / "joined.webm").read_bytes()
+    expected_suffix = "-interrupted.webm" if case.endswith("interrupted") else ".webm"
+    assert f"section-1{expected_suffix}" in downloaded.headers["content-disposition"]
+
+
 def test_completion_frame_count_requires_a_nonnegative_integer(client: TestClient) -> None:
     project = create_project(client)
     section, _response = create_section(client, project["id"])
@@ -512,6 +1071,7 @@ def test_openapi_declares_routes_security_locations_and_problem_details(
         "/api/v1/audio-assets/{audio_asset_id}/frames/{sequence}",
         "/api/v1/audio-assets/{audio_asset_id}/complete",
         "/api/v1/audio-assets/{audio_asset_id}/interrupt",
+        "/api/v1/audio-assets/{audio_asset_id}/download",
     } <= paths.keys()
     create_operation = paths["/api/v1/projects"]["post"]
     assert create_operation["security"] == [{"HTTPBasic": []}]
@@ -550,6 +1110,25 @@ def test_openapi_declares_routes_security_locations_and_problem_details(
         assert (
             "application/problem+json"
             in frame_operation["responses"][status_code]["content"]
+        )
+    download_operation = paths[
+        "/api/v1/audio-assets/{audio_asset_id}/download"
+    ]["get"]
+    assert download_operation["responses"]["200"]["content"] == {
+        "audio/webm;codecs=opus": {
+            "schema": {"type": "string", "format": "binary"},
+        }
+    }
+    assert {"Content-Disposition", "Content-Length"} <= set(
+        download_operation["responses"]["200"]["headers"]
+    )
+    assert {"401", "404", "409", "422", "429", "500", "503"} <= set(
+        download_operation["responses"]
+    )
+    for status_code in ("401", "404", "409", "422", "429", "500", "503"):
+        assert (
+            "application/problem+json"
+            in download_operation["responses"][status_code]["content"]
         )
 
 

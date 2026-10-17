@@ -30,4 +30,5 @@ def test_compose_publishes_separate_api_and_database_admin_services() -> None:
     assert configuration["services"]["db-admin"]["profiles"] == ["tools"]
     assert "application-data" in configuration["volumes"]
     assert configuration["services"]["api"]["build"]["target"] == "api"
+    assert configuration["services"]["api"]["environment"]["MAX_STAGED_DOWNLOAD_FILES"] == "20"
     assert configuration["services"]["db-admin"]["build"]["target"] == "db-admin"

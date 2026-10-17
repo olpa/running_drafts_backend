@@ -5,6 +5,7 @@ from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_MAX_TRANSPORT_FRAME_BYTES = 2 * 1024 * 1024
+DEFAULT_MAX_STAGED_DOWNLOAD_FILES = 20
 
 
 class AppEnvironment(StrEnum):
@@ -84,6 +85,11 @@ class Settings(BasicIdentitySettings):
         default=DEFAULT_MAX_TRANSPORT_FRAME_BYTES,
         gt=0,
         validation_alias="MAX_TRANSPORT_FRAME_BYTES",
+    )
+    max_staged_download_files: int = Field(
+        default=DEFAULT_MAX_STAGED_DOWNLOAD_FILES,
+        gt=0,
+        validation_alias="MAX_STAGED_DOWNLOAD_FILES",
     )
 
     @field_validator("allowed_origins")

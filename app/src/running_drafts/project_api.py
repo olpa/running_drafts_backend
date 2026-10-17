@@ -1,8 +1,13 @@
+import unicodedata
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
+from threading import BoundedSemaphore, Lock
 from typing import Annotated, Any, Literal
+from urllib.parse import quote
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, Path, Request, Response, status
+from fastapi.responses import StreamingResponse
 from pydantic import Field, field_validator
 from starlette.concurrency import run_in_threadpool
 
@@ -17,6 +22,7 @@ from running_drafts.project_storage import (
     ProjectStorage,
     ProjectSummary,
     SectionCreation,
+    StagedAudioDownload,
     UnsupportedMediaType,
     canonicalize_media_type,
     normalize_title,
@@ -24,6 +30,56 @@ from running_drafts.project_storage import (
 from running_drafts.settings import DEFAULT_MAX_TRANSPORT_FRAME_BYTES, Settings
 
 MAX_SQLITE_INTEGER = 2**63 - 1
+
+
+class ConcurrentDownloadLimitExceeded(Exception):
+    pass
+
+
+class DownloadCapacity:
+    def __init__(self, maximum: int) -> None:
+        self._semaphore = BoundedSemaphore(maximum)
+
+    def acquire(self) -> None:
+        if not self._semaphore.acquire(blocking=False):
+            raise ConcurrentDownloadLimitExceeded
+
+    def release(self) -> None:
+        self._semaphore.release()
+
+
+class StagedDownloadLease:
+    def __init__(
+        self,
+        download: StagedAudioDownload,
+        release_capacity: Callable[[], None],
+    ) -> None:
+        self.download = download
+        self._release_capacity = release_capacity
+        self._closed = False
+        self._lock = Lock()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                self.download.stream.close()
+            finally:
+                self._release_capacity()
+
+
+class ManagedDownloadResponse(StreamingResponse):
+    def __init__(self, lease: StagedDownloadLease, **kwargs: Any) -> None:
+        self._lease = lease
+        super().__init__(_download_body(lease), **kwargs)
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._lease.close()
 
 
 class CreateProjectRequest(CamelCaseRequest):
@@ -188,6 +244,53 @@ def _frame_problem(status_code: int, title: str, detail: str, code: str) -> Prob
     return ProblemException(status=status_code, title=title, detail=detail, code=code)
 
 
+def _download_suffix(download: StagedAudioDownload) -> str:
+    suffix = f"-section-{download.section_position + 1}"
+    if download.seal_reason == "interrupted":
+        suffix += "-interrupted"
+    return f"{suffix}.webm"
+
+
+def _download_filename(download: StagedAudioDownload) -> str:
+    suffix = _download_suffix(download)
+    slug_parts: list[str] = []
+    separator_pending = False
+    retained_base = False
+    for character in unicodedata.normalize("NFC", download.project_title):
+        category = unicodedata.category(character)[0]
+        if category in {"L", "N"} or (category == "M" and retained_base):
+            if separator_pending and slug_parts:
+                slug_parts.append("-")
+            slug_parts.append(character)
+            separator_pending = False
+            retained_base = True
+        else:
+            separator_pending = True
+            retained_base = False
+    slug = "".join(slug_parts) or "untitled"
+    maximum_slug_bytes = 240 - len(suffix.encode())
+    while len(slug.encode()) > maximum_slug_bytes:
+        slug = slug[:-1]
+    slug = slug.rstrip("-") or "untitled"
+    return f"{slug}{suffix}"
+
+
+def _ascii_download_filename(download: StagedAudioDownload, filename: str) -> str:
+    if filename.isascii():
+        return filename
+    return f"download{_download_suffix(download)}"
+
+
+def _download_body(
+    lease: StagedDownloadLease,
+) -> Iterator[bytes]:
+    try:
+        while chunk := lease.download.stream.read(64 * 1024):
+            yield chunk
+    finally:
+        lease.close()
+
+
 async def _read_frame_body(request: Request, maximum_bytes: int) -> bytes:
     content_length = request.headers.get("content-length")
     if content_length is not None:
@@ -275,6 +378,29 @@ CONFLICT_RESPONSES = NOT_FOUND_RESPONSES | {
 FRAME_RESPONSES = CONFLICT_RESPONSES | {
     413: _problem_response("Frame body exceeds the configured size limit"),
     415: _problem_response("Frame media type is unsupported"),
+}
+DOWNLOAD_RESPONSES = CONFLICT_RESPONSES | {
+    200: {
+        "description": "Sealed original audio",
+        "content": {
+            "audio/webm;codecs=opus": {
+                "schema": {"type": "string", "format": "binary"},
+            }
+        },
+        "headers": {
+            "Content-Disposition": {
+                "description": "Attachment filename",
+                "schema": {"type": "string"},
+            },
+            "Content-Length": {
+                "description": "Exact assembled byte length",
+                "schema": {"type": "integer"},
+            },
+        },
+    },
+    429: _problem_response("Concurrent download limit exceeded"),
+    500: _problem_response("Audio assembly failed"),
+    503: _problem_response("Database or temporary storage unavailable"),
 }
 CREATED_RESPONSE = {
     "headers": {
@@ -468,3 +594,43 @@ def interrupt_audio_asset(
     storage: Storage,
 ) -> AudioAssetSummaryResponse:
     return _audio_asset_response(storage.interrupt_audio_asset(user_id, audio_asset_id))
+
+
+@router.get(
+    "/audio-assets/{audio_asset_id}/download",
+    response_class=StreamingResponse,
+    responses=DOWNLOAD_RESPONSES,
+)
+def download_audio_asset(
+    request: Request,
+    audio_asset_id: UUID4,
+    user_id: AuthenticatedUser,
+    storage: Storage,
+) -> StreamingResponse:
+    capacity: DownloadCapacity = request.app.state.download_capacity
+    capacity.acquire()
+    try:
+        download = storage.stage_audio_download(user_id, audio_asset_id)
+    except BaseException:
+        capacity.release()
+        raise
+    lease = StagedDownloadLease(download, capacity.release)
+    try:
+        filename = _download_filename(download)
+        ascii_filename = _ascii_download_filename(download, filename)
+        return ManagedDownloadResponse(
+            lease,
+            media_type="audio/webm;codecs=opus",
+            headers={
+                "Content-Length": str(download.content_length),
+                "Content-Disposition": (
+                    f'attachment; filename="{ascii_filename}"; '
+                    f"filename*=UTF-8''{quote(filename, safe='!#$&+-.^_`|~')}"
+                ),
+                "Cache-Control": "private, no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+    except BaseException:
+        lease.close()
+        raise
