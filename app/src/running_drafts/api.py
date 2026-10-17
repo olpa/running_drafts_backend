@@ -12,11 +12,18 @@ from running_drafts.auth import ensure_authentication_adapter_is_available
 from running_drafts.database import DatabaseConfigurationError, existing_connection
 from running_drafts.migrations import MIGRATION_HEAD
 from running_drafts.problems import ProblemException, problem_response
+from running_drafts.project_api import (
+    ConcurrentDownloadLimitExceeded,
+    DownloadCapacity,
+)
 from running_drafts.project_api import router as project_router
 from running_drafts.project_storage import (
+    AudioAssemblyFailure,
+    AudioAssetNotSealed,
     AudioAssetSealConflict,
     DatabaseBusy,
     DatabaseUnavailable,
+    DownloadStorageUnavailable,
     FrameConflict,
     IdempotencyKeyReused,
     ResourceNotFound,
@@ -57,12 +64,14 @@ def create_app(settings: Settings) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.settings = settings
+    app.state.download_capacity = DownloadCapacity(settings.max_staged_download_files)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.allowed_origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=["Content-Disposition"],
     )
 
     @app.exception_handler(ProblemException)
@@ -108,6 +117,42 @@ def create_app(settings: Settings) -> FastAPI:
             code="audio_asset_seal_conflict",
         )
 
+    @app.exception_handler(AudioAssetNotSealed)
+    def handle_asset_not_sealed(
+        _request: Request,
+        _error: AudioAssetNotSealed,
+    ) -> JSONResponse:
+        return problem_response(
+            status=409,
+            title="Audio asset not sealed",
+            detail="The audio asset must be sealed before it can be downloaded.",
+            code="asset_not_sealed",
+        )
+
+    @app.exception_handler(AudioAssemblyFailure)
+    def handle_audio_assembly_failure(
+        _request: Request,
+        error: AudioAssemblyFailure,
+    ) -> JSONResponse:
+        logger.error(
+            "audio assembly failed: audio_asset_id=%s expected_frame_count=%s "
+            "actual_frame_count=%s expected_bytes=%s actual_bytes=%s "
+            "offending_sequence=%s nearby_hashes=%s",
+            error.audio_asset_id,
+            error.expected_frame_count,
+            error.actual_frame_count,
+            error.expected_bytes,
+            error.actual_bytes,
+            error.offending_sequence,
+            error.nearby_hashes,
+        )
+        return problem_response(
+            status=500,
+            title="Audio assembly failed",
+            detail="The stored audio could not be assembled.",
+            code="audio_assembly_failed",
+        )
+
     @app.exception_handler(FrameConflict)
     def handle_frame_conflict(_request: Request, _error: FrameConflict) -> JSONResponse:
         return problem_response(
@@ -136,6 +181,30 @@ def create_app(settings: Settings) -> FastAPI:
             title="Database unavailable",
             detail="The database is unavailable.",
             code="database_unavailable",
+        )
+
+    @app.exception_handler(DownloadStorageUnavailable)
+    def handle_download_storage_unavailable(
+        _request: Request,
+        _error: DownloadStorageUnavailable,
+    ) -> JSONResponse:
+        return problem_response(
+            status=503,
+            title="Storage unavailable",
+            detail="Temporary storage is unavailable.",
+            code="storage_unavailable",
+        )
+
+    @app.exception_handler(ConcurrentDownloadLimitExceeded)
+    def handle_concurrent_download_limit(
+        _request: Request,
+        _error: ConcurrentDownloadLimitExceeded,
+    ) -> JSONResponse:
+        return problem_response(
+            status=429,
+            title="Concurrent download limit exceeded",
+            detail="The service is already staging the maximum number of downloads.",
+            code="concurrent_download_limit_exceeded",
         )
 
     @app.exception_handler(RequestValidationError)

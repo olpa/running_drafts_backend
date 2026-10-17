@@ -119,6 +119,23 @@ def test_security_sensitive_settings_are_strict(tmp_path: Path) -> None:
         )
 
 
+def test_staged_download_limit_defaults_to_twenty_and_must_be_positive(
+    tmp_path: Path,
+) -> None:
+    common = {
+        "app_env": AppEnvironment.TEST,
+        "auth_mode": AuthMode.BASIC,
+        "database_path": tmp_path / "application.sqlite3",
+        "allowed_origins": ["https://editor.test"],
+        "basic_auth_usernames": ["Alice"],
+        "basic_auth_password": "password",
+    }
+
+    assert Settings(**common).max_staged_download_files == 20
+    with pytest.raises(ValidationError):
+        Settings(**common, max_staged_download_files=0)
+
+
 def test_auth0_fails_when_the_application_starts(tmp_path: Path) -> None:
     settings = Settings(
         app_env=AppEnvironment.PRODUCTION,

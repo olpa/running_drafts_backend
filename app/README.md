@@ -16,6 +16,8 @@ startup until backend issue #8 supplies the production adapter. CORS origins and
 Basic usernames are JSON arrays. CORS wildcards are rejected.
 `MAX_TRANSPORT_FRAME_BYTES` bounds each streamed audio frame and defaults to
 2097152 bytes (2 MiB).
+`MAX_STAGED_DOWNLOAD_FILES` bounds concurrent audio downloads per application
+process and defaults to 20.
 
 ## Docker Compose workflow
 

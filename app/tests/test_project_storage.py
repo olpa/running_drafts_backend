@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import sqlite3
@@ -5,13 +6,19 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from tempfile import TemporaryFile
 from threading import Event
 from uuid import UUID, uuid4
 
 import pytest
 
 from running_drafts.database import existing_connection
-from running_drafts.project_storage import FrameConflict, ProjectStorage, ResourceNotFound
+from running_drafts.project_storage import (
+    AudioAssemblyFailure,
+    FrameConflict,
+    ProjectStorage,
+    ResourceNotFound,
+)
 
 
 def run_admin(command: str, database_path: Path) -> subprocess.CompletedProcess[str]:
@@ -589,3 +596,212 @@ def test_project_database_cascade_removes_stored_frames(tmp_path: Path) -> None:
     assert store.used_audio_bytes(owner_id) == 0
     with pytest.raises(ResourceNotFound):
         store.get_project(owner_id, project.id)
+
+
+def test_audio_download_rejects_inconsistent_stored_byte_accounting(tmp_path: Path) -> None:
+    database_path = migrated_database(tmp_path)
+    owner_id = user_id(database_path)
+    store = storage(database_path)
+    project = store.create_project(owner_id, uuid4(), "Damaged accounting").value
+    asset_id = store.create_section(
+        owner_id,
+        project.id,
+        uuid4(),
+        "audio/webm;codecs=opus",
+    ).value.audio_asset_id
+    store.accept_audio_frame(
+        owner_id,
+        asset_id,
+        sequence=0,
+        start_ms=0,
+        end_ms=1_000,
+        media_type="audio/webm;codecs=opus",
+        payload=b"frame",
+    )
+    store.complete_audio_asset(owner_id, asset_id, 1)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "UPDATE audio_assets SET stored_bytes = 999 WHERE id = ?",
+            (str(asset_id),),
+        )
+
+    with pytest.raises(AudioAssemblyFailure):
+        store.stage_audio_download(owner_id, asset_id)
+
+
+def test_audio_download_rejects_a_short_temporary_file_write(tmp_path: Path) -> None:
+    database_path = migrated_database(tmp_path)
+    owner_id = user_id(database_path)
+    base = storage(database_path)
+    project = base.create_project(owner_id, uuid4(), "Short write").value
+    asset_id = base.create_section(
+        owner_id,
+        project.id,
+        uuid4(),
+        "audio/webm;codecs=opus",
+    ).value.audio_asset_id
+    base.accept_audio_frame(
+        owner_id,
+        asset_id,
+        sequence=0,
+        start_ms=0,
+        end_ms=1_000,
+        media_type="audio/webm;codecs=opus",
+        payload=b"frame",
+    )
+    base.complete_audio_asset(owner_id, asset_id, 1)
+
+    staged_file_closed = Event()
+
+    class ShortWritingFile:
+        def __init__(self) -> None:
+            self.wrapped = TemporaryFile(mode="w+b")  # noqa: SIM115 - storage owns it
+
+        def write(self, payload: bytes) -> int:
+            return self.wrapped.write(payload[:-1])
+
+        def close(self) -> None:
+            self.wrapped.close()
+            staged_file_closed.set()
+
+        def __getattr__(self, name: str):
+            return getattr(self.wrapped, name)
+
+    downloader = storage(database_path, temporary_file_factory=ShortWritingFile)
+
+    with pytest.raises(AudioAssemblyFailure):
+        downloader.stage_audio_download(owner_id, asset_id)
+    assert staged_file_closed.is_set()
+
+
+def test_audio_assembly_failure_reports_hashes_near_the_sequence_gap(
+    tmp_path: Path,
+) -> None:
+    database_path = migrated_database(tmp_path)
+    owner_id = user_id(database_path)
+    store = storage(database_path)
+    project = store.create_project(owner_id, uuid4(), "Sequence gap").value
+    asset_id = store.create_section(
+        owner_id,
+        project.id,
+        uuid4(),
+        "audio/webm;codecs=opus",
+    ).value.audio_asset_id
+    payloads = [f"frame-{sequence}".encode() for sequence in range(5)]
+    for sequence, payload in enumerate(payloads):
+        store.accept_audio_frame(
+            owner_id,
+            asset_id,
+            sequence=sequence,
+            start_ms=sequence * 1_000,
+            end_ms=(sequence + 1) * 1_000,
+            media_type="audio/webm;codecs=opus",
+            payload=payload,
+        )
+    store.complete_audio_asset(owner_id, asset_id, 5)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "DELETE FROM transport_frames WHERE audio_asset_id = ? AND sequence = 1",
+            (str(asset_id),),
+        )
+
+    with pytest.raises(AudioAssemblyFailure) as raised:
+        store.stage_audio_download(owner_id, asset_id)
+
+    assert raised.value.offending_sequence == 2
+    assert raised.value.nearby_hashes == (
+        hashlib.sha256(payloads[0]).hexdigest(),
+        hashlib.sha256(payloads[2]).hexdigest(),
+    )
+
+
+def test_audio_download_and_deletion_follow_snapshot_order(tmp_path: Path) -> None:
+    database_path = migrated_database(tmp_path)
+    owner_id = user_id(database_path)
+    base = storage(database_path)
+    project = base.create_project(owner_id, uuid4(), "Deletion race").value
+    asset_id = base.create_section(
+        owner_id,
+        project.id,
+        uuid4(),
+        "audio/webm;codecs=opus",
+    ).value.audio_asset_id
+    base.accept_audio_frame(
+        owner_id,
+        asset_id,
+        sequence=0,
+        start_ms=0,
+        end_ms=1_000,
+        media_type="audio/webm;codecs=opus",
+        payload=b"retained snapshot",
+    )
+    base.complete_audio_asset(owner_id, asset_id, 1)
+    snapshot_established = Event()
+    allow_staging = Event()
+
+    def paused_temporary_file():
+        snapshot_established.set()
+        assert allow_staging.wait(timeout=5)
+        return TemporaryFile(mode="w+b")
+
+    downloader = storage(database_path, temporary_file_factory=paused_temporary_file)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        staging = executor.submit(downloader.stage_audio_download, owner_id, asset_id)
+        assert snapshot_established.wait(timeout=5)
+        with existing_connection(database_path, busy_timeout_ms=5_000) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("DELETE FROM projects WHERE id = ?", (str(project.id),))
+            connection.commit()
+        allow_staging.set()
+        staged = staging.result(timeout=5)
+
+    try:
+        assert staged.stream.read() == b"retained snapshot"
+    finally:
+        staged.stream.close()
+    with pytest.raises(ResourceNotFound):
+        base.stage_audio_download(owner_id, asset_id)
+
+
+def test_audio_download_returns_not_found_when_deletion_commits_first(
+    tmp_path: Path,
+) -> None:
+    database_path = migrated_database(tmp_path)
+    owner_id = user_id(database_path)
+    store = storage(database_path)
+    project = store.create_project(owner_id, uuid4(), "Deletion first").value
+    asset_id = store.create_section(
+        owner_id,
+        project.id,
+        uuid4(),
+        "audio/webm;codecs=opus",
+    ).value.audio_asset_id
+    store.complete_audio_asset(owner_id, asset_id, 0)
+    deletion_has_transaction = Event()
+    download_is_waiting = Event()
+    allow_deletion_commit = Event()
+    deletion_committed = Event()
+
+    def delete_project() -> None:
+        with existing_connection(database_path, busy_timeout_ms=5_000) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("DELETE FROM projects WHERE id = ?", (str(project.id),))
+            deletion_has_transaction.set()
+            assert allow_deletion_commit.wait(timeout=5)
+            connection.commit()
+        deletion_committed.set()
+
+    def download_after_commit():
+        assert deletion_has_transaction.wait(timeout=5)
+        download_is_waiting.set()
+        assert deletion_committed.wait(timeout=5)
+        return store.stage_audio_download(owner_id, asset_id)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        deleting = executor.submit(delete_project)
+        downloading = executor.submit(download_after_commit)
+        assert download_is_waiting.wait(timeout=5)
+        allow_deletion_commit.set()
+        deleting.result(timeout=5)
+        with pytest.raises(ResourceNotFound):
+            downloading.result(timeout=5)
