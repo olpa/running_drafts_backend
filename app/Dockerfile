@@ -14,8 +14,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --no-editable
 
 FROM python:3.15.0-slim AS runtime
-RUN groupadd --system running-drafts \
-    && useradd --system --gid running-drafts --home-dir /app running-drafts \
+RUN groupadd --gid 1000 running-drafts \
+    && useradd --uid 1000 --gid running-drafts --no-create-home \
+        --home-dir /app --shell /usr/sbin/nologin running-drafts \
     && mkdir /data \
     && chown running-drafts:running-drafts /data
 WORKDIR /app

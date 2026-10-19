@@ -1,0 +1,67 @@
+x-database-environment: &database-environment
+  APP_ENV: ${APP_ENV:?APP_ENV is required}
+  AUTH_MODE: basic
+  DATABASE_PATH: /data/running-drafts.sqlite3
+  DATABASE_BUSY_TIMEOUT_MS: ${DATABASE_BUSY_TIMEOUT_MS:-5000}
+  BASIC_AUTH_USERNAMES: '${BASIC_AUTH_USERNAMES:?BASIC_AUTH_USERNAMES is required}'
+
+x-runtime: &runtime
+  image: running-drafts-backend:${IMAGE_TAG:?IMAGE_TAG is required}
+  init: true
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  volumes:
+    - ${DATA_DIRECTORY:?DATA_DIRECTORY is required}:/data
+    - ${BACKUP_DIRECTORY:?BACKUP_DIRECTORY is required}:/backups
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  api:
+    <<: *runtime
+    environment:
+      <<: *database-environment
+      ALLOWED_ORIGINS: '${ALLOWED_ORIGINS:?ALLOWED_ORIGINS is required}'
+      BASIC_AUTH_PASSWORD: ${BASIC_AUTH_PASSWORD:?BASIC_AUTH_PASSWORD is required}
+      MAX_STAGED_DOWNLOAD_FILES: ${MAX_STAGED_DOWNLOAD_FILES:-20}
+      MAX_TRANSPORT_FRAME_BYTES: ${MAX_TRANSPORT_FRAME_BYTES:-2097152}
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: 8000
+    ports:
+      - "127.0.0.1:${HTTP_PORT:?HTTP_PORT is required}:8000"
+      - "[::1]:${HTTP_PORT}:8000"
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=2)
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    mem_reservation: 64m
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 128
+    restart: unless-stopped
+
+  db-admin:
+    <<: *runtime
+    profiles: [tools]
+    environment:
+      <<: *database-environment
+    mem_limit: 128m
+    cpus: 0.5
+    pids_limit: 64
+    restart: "no"
