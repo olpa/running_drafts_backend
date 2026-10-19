@@ -74,10 +74,12 @@ def test_compose_migrates_seeds_serves_and_restarts() -> None:
         migrated = compose("run", "--rm", "--build", "db-admin", "migrate")
         fixtures = compose("run", "--rm", "db-admin", "fixtures")
         compose("up", "-d", "--build", "api")
+        identity = compose("exec", "-T", "api", "id", "-u")
         base_url = api_base_url()
 
         assert last_json_event(migrated.stdout)["schema_version"] == 2
         assert last_json_event(fixtures.stdout)["insertedUsers"] == 1
+        assert identity.stdout.strip() == "1000"
         assert wait_for(f"{base_url}/health/live") == {"status": "ok"}
         assert wait_for(f"{base_url}/health/ready") == {"status": "ok"}
 
@@ -86,3 +88,42 @@ def test_compose_migrates_seeds_serves_and_restarts() -> None:
         assert wait_for(f"{base_url}/health/ready") == {"status": "ok"}
     finally:
         compose("down", "-v", "--remove-orphans", check=False)
+
+
+@pytest.mark.container
+@pytest.mark.skipif(not RUN_CONTAINER_TESTS, reason="set RUN_CONTAINER_TESTS=1")
+def test_make_image_builds_the_api_runtime() -> None:
+    image_tag = f"test-{uuid4().hex[:12]}"
+    image = f"running-drafts-backend:{image_tag}"
+    try:
+        build = subprocess.run(
+            ["make", f"IMAGE_TAG={image_tag}", "image"],
+            cwd=APP_DIRECTORY,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert build.returncode == 0, build.stderr
+
+        configuration = subprocess.run(
+            [
+                "docker",
+                "image",
+                "inspect",
+                image,
+                "--format",
+                "{{json .Config.Cmd}} {{json .Config.User}}",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert configuration.returncode == 0, configuration.stderr
+        assert configuration.stdout.strip() == '["serve"] "running-drafts"'
+    finally:
+        subprocess.run(
+            ["docker", "image", "rm", image],
+            text=True,
+            capture_output=True,
+            check=False,
+        )

@@ -110,13 +110,13 @@ def test_security_sensitive_settings_are_strict(tmp_path: Path) -> None:
             allowed_origins=["https://editor.test"],
             **common | {"basic_auth_usernames": ["bad user"]},
         )
-    with pytest.raises(ValidationError):
-        Settings(
-            app_env=AppEnvironment.PRODUCTION,
-            auth_mode=AuthMode.BASIC,
-            allowed_origins=["https://editor.example"],
-            **common,
-        )
+    production = Settings(
+        app_env=AppEnvironment.PRODUCTION,
+        auth_mode=AuthMode.BASIC,
+        allowed_origins=["https://editor.example"],
+        **common,
+    )
+    assert production.auth_mode is AuthMode.BASIC
 
 
 def test_staged_download_limit_defaults_to_twenty_and_must_be_positive(

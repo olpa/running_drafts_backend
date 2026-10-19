@@ -43,6 +43,28 @@ def test_liveness_does_not_access_a_missing_database(tmp_path: Path) -> None:
     assert not database_path.exists()
 
 
+def test_production_health_is_public_with_basic_auth(tmp_path: Path) -> None:
+    database_path = tmp_path / "application.sqlite3"
+    migrate_database(database_path)
+    settings = Settings(
+        app_env=AppEnvironment.PRODUCTION,
+        auth_mode=AuthMode.BASIC,
+        database_path=database_path,
+        allowed_origins=["https://drafts.handsfree.vc"],
+        basic_auth_usernames=["operator"],
+        basic_auth_password="production-password",
+    )
+
+    with TestClient(create_app(settings)) as client:
+        liveness = client.get("/health/live")
+        readiness = client.get("/health/ready")
+
+    assert liveness.status_code == 200
+    assert readiness.status_code == 200
+    assert "www-authenticate" not in liveness.headers
+    assert "www-authenticate" not in readiness.headers
+
+
 def test_readiness_does_not_create_a_missing_database(tmp_path: Path) -> None:
     database_path = tmp_path / "missing.sqlite3"
 

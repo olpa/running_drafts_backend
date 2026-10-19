@@ -11,9 +11,10 @@ from the Whisper service in `../inference`.
   development password before using Compose
 
 `APP_ENV` must be `development`, `test`, or `production`. `AUTH_MODE=basic` is
-available only in development and test. `AUTH_MODE=auth0` deliberately fails at
-startup until backend issue #8 supplies the production adapter. CORS origins and
-Basic usernames are JSON arrays. CORS wildcards are rejected.
+temporarily available in every environment so the initial deployed health
+surface can run before backend issue #8 supplies the production Auth0 adapter.
+`AUTH_MODE=auth0` deliberately fails at startup until that adapter exists. CORS
+origins and Basic usernames are JSON arrays. CORS wildcards are rejected.
 `MAX_TRANSPORT_FRAME_BYTES` bounds each streamed audio frame and defaults to
 2097152 bytes (2 MiB).
 `MAX_STAGED_DOWNLOAD_FILES` bounds concurrent audio downloads per application
@@ -86,6 +87,20 @@ smoke test with:
 ```bash
 RUN_CONTAINER_TESTS=1 uv run pytest -m container
 ```
+
+## Host deployment
+
+The host deployment uses a locally built, explicitly tagged image and separate
+development and production SQLite directories under
+`/rnotes/RUNNING_DRAFTS_BACKEND`. Build a release from this directory with:
+
+```bash
+IMAGE_TAG=0.1.0 make image
+```
+
+The deployment Compose file publishes plain HTTP on loopback only. boringproxy
+owns public HTTPS and its certificates. See [`deployment/README.md`](deployment/README.md)
+for target names, ports, migration, startup, backup, and rollback commands.
 
 The real-browser ordered WebM assembly evidence and deterministic empty-audio
 fixture are documented in [`../docs/webm-assembly-evidence.md`](../docs/webm-assembly-evidence.md).

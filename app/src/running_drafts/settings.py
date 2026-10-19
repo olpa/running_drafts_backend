@@ -105,8 +105,6 @@ class Settings(BasicIdentitySettings):
     def validate_authentication_mode(self) -> Settings:
         if self.auth_mode is AuthMode.AUTH0:
             return self
-        if self.app_env is AppEnvironment.PRODUCTION:
-            raise ValueError("AUTH_MODE=basic is forbidden in production")
         if not self.basic_auth_usernames:
             raise ValueError("at least one Basic username is required")
         if self.basic_auth_password is None or not self.basic_auth_password.get_secret_value():
