@@ -34,10 +34,17 @@ database owns certificate issuance and renewal; this deployment owns no TLS
 private keys. The boringproxy routes use server TLS termination and target
 ports 18081 and 18082 respectively.
 
-The health endpoints are public. Basic authentication is configured so the
-application can start, but this bootstrap deployment intentionally provisions
-no users. `/health/live` reports process health and `/health/ready` additionally
-requires the explicitly migrated SQLite database.
+The health endpoints are public. Browser authentication uses direct Google OIDC
+and server-side Application Sessions. Development and production use separate
+Google registrations and these exact callbacks:
+
+- `https://drafts-api-dev.handsfree.vc/auth/callback/google`
+- `https://drafts-api.handsfree.vc/auth/callback/google`
+
+Keep client secrets only in the target `.env.dev` and `.env.prod` files on the
+host; never copy them into the repository or logs. `/health/live` reports
+process health and `/health/ready` additionally requires the explicitly
+migrated SQLite database.
 
 Use `status-dev.sh` or `status-prod.sh` for local readiness, and pass normal
 Compose log options to `logs-dev.sh` or `logs-prod.sh`. `backup-dev.sh` and
@@ -66,3 +73,11 @@ curl --fail https://drafts-api-dev.handsfree.vc/health/ready
 ```
 
 Use the corresponding `prod` script and hostname for production.
+
+For the deployed Google smoke, use a fresh private browser, sign in through the
+target editor, verify the requested editor path is restored and `/api/v1/me`
+returns an Account plus `sessionExpiresAt`, create and retrieve a private draft,
+log out, and verify protected access returns `401 authentication_required`.
+Sign in again and verify the same Account and draft return. Record only target,
+timestamp, provider, result, and any safe correlation ID—never credentials,
+authorization codes, tokens, cookies, subjects, emails, or raw claims.

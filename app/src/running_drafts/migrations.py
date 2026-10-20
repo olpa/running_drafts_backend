@@ -38,6 +38,7 @@ def _execute_sql_resource(filename: str) -> MigrationAction:
 MIGRATIONS = (
     Migration(1, _execute_sql_resource("0001_users.sql")),
     Migration(2, _execute_sql_resource("0002_projects.sql")),
+    Migration(3, _execute_sql_resource("0003_oidc.sql")),
 )
 MIGRATION_HEAD = MIGRATIONS[-1].version
 

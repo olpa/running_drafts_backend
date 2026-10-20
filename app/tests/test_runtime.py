@@ -6,7 +6,6 @@ import sys
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from running_drafts.api import create_app
@@ -110,13 +109,13 @@ def test_security_sensitive_settings_are_strict(tmp_path: Path) -> None:
             allowed_origins=["https://editor.test"],
             **common | {"basic_auth_usernames": ["bad user"]},
         )
-    production = Settings(
-        app_env=AppEnvironment.PRODUCTION,
-        auth_mode=AuthMode.BASIC,
-        allowed_origins=["https://editor.example"],
-        **common,
-    )
-    assert production.auth_mode is AuthMode.BASIC
+    with pytest.raises(ValidationError):
+        Settings(
+            app_env=AppEnvironment.PRODUCTION,
+            auth_mode=AuthMode.BASIC,
+            allowed_origins=["https://editor.example"],
+            **common,
+        )
 
 
 def test_staged_download_limit_defaults_to_twenty_and_must_be_positive(
@@ -136,32 +135,31 @@ def test_staged_download_limit_defaults_to_twenty_and_must_be_positive(
         Settings(**common, max_staged_download_files=0)
 
 
-def test_auth0_fails_when_the_application_starts(tmp_path: Path) -> None:
+def test_oidc_starts_without_a_configured_provider(tmp_path: Path) -> None:
     settings = Settings(
         app_env=AppEnvironment.PRODUCTION,
-        auth_mode=AuthMode.AUTH0,
+        auth_mode=AuthMode.OIDC,
         database_path=tmp_path / "application.sqlite3",
         allowed_origins=["https://editor.example"],
+        public_editor_url="https://editor.example",
     )
 
-    with (
-        pytest.raises(RuntimeError, match="AUTH_MODE=auth0 is not implemented"),
-        TestClient(create_app(settings)),
-    ):
-        pass
+    assert create_app(settings).state.provider_registry.configured() == ()
 
 
-def test_serve_reports_unsupported_auth0_as_a_structured_error(
+def test_serve_reports_partial_oidc_configuration_as_a_structured_error(
     tmp_path: Path,
 ) -> None:
     result = run_command(
         "serve",
         tmp_path / "missing.sqlite3",
         APP_ENV="production",
-        AUTH_MODE="auth0",
+        AUTH_MODE="oidc",
         ALLOWED_ORIGINS=json.dumps(["https://editor.example"]),
+        PUBLIC_EDITOR_URL="https://editor.example",
+        GOOGLE_CLIENT_ID="configured-without-secret",
     )
 
     assert result.returncode != 0
     assert json.loads(result.stderr)["event"] == "command_failed"
-    assert "not implemented" in json.loads(result.stderr)["error"]
+    assert "incomplete" in json.loads(result.stderr)["error"]

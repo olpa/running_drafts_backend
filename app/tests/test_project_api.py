@@ -1074,7 +1074,7 @@ def test_openapi_declares_routes_security_locations_and_problem_details(
         "/api/v1/audio-assets/{audio_asset_id}/download",
     } <= paths.keys()
     create_operation = paths["/api/v1/projects"]["post"]
-    assert create_operation["security"] == [{"HTTPBasic": []}]
+    assert create_operation["security"] == [{"ApplicationSession": []}]
     assert "Location" in create_operation["responses"]["201"]["headers"]
     assert "WWW-Authenticate" in create_operation["responses"]["401"]["headers"]
     assert "application/problem+json" in create_operation["responses"]["422"]["content"]
@@ -1084,7 +1084,7 @@ def test_openapi_declares_routes_security_locations_and_problem_details(
     frame_operation = paths[
         "/api/v1/audio-assets/{audio_asset_id}/frames/{sequence}"
     ]["put"]
-    assert frame_operation["security"] == [{"HTTPBasic": []}]
+    assert frame_operation["security"] == [{"ApplicationSession": []}]
     assert {
         parameter["name"]: (parameter["in"], parameter["required"])
         for parameter in frame_operation["parameters"]

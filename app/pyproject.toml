@@ -5,6 +5,8 @@ description = "Running Drafts application backend"
 requires-python = ">=3.15,<3.16"
 dependencies = [
     "fastapi>=0.118",
+    "httpx>=0.28",
+    "joserfc>=1.7",
     "pydantic-settings>=2.11",
     "uvicorn>=0.37",
 ]

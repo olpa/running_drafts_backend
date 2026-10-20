@@ -1,9 +1,9 @@
 x-database-environment: &database-environment
   APP_ENV: ${APP_ENV:?APP_ENV is required}
-  AUTH_MODE: basic
+  AUTH_MODE: oidc
   DATABASE_PATH: /data/running-drafts.sqlite3
   DATABASE_BUSY_TIMEOUT_MS: ${DATABASE_BUSY_TIMEOUT_MS:-5000}
-  BASIC_AUTH_USERNAMES: '${BASIC_AUTH_USERNAMES:?BASIC_AUTH_USERNAMES is required}'
+  BASIC_AUTH_USERNAMES: '[]'
 
 x-runtime: &runtime
   image: running-drafts-backend:${IMAGE_TAG:?IMAGE_TAG is required}
@@ -28,7 +28,11 @@ services:
     environment:
       <<: *database-environment
       ALLOWED_ORIGINS: '${ALLOWED_ORIGINS:?ALLOWED_ORIGINS is required}'
-      BASIC_AUTH_PASSWORD: ${BASIC_AUTH_PASSWORD:?BASIC_AUTH_PASSWORD is required}
+      PUBLIC_EDITOR_URL: ${PUBLIC_EDITOR_URL:?PUBLIC_EDITOR_URL is required}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-}
+      SESSION_COOKIE_SECURE: "true"
       MAX_STAGED_DOWNLOAD_FILES: ${MAX_STAGED_DOWNLOAD_FILES:-20}
       MAX_TRANSPORT_FRAME_BYTES: ${MAX_TRANSPORT_FRAME_BYTES:-2097152}
       SERVER_HOST: 0.0.0.0
