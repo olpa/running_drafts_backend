@@ -123,16 +123,16 @@ def test_missing_fixture_for_valid_credentials_is_an_operator_error(
     assert response.json()["code"] == "internal_configuration_error"
 
 
-def test_fixtures_reject_production_and_auth0_without_creating_a_database(
+def test_fixtures_reject_production_and_oidc_without_creating_a_database(
     tmp_path: Path,
 ) -> None:
     production_database = tmp_path / "production.sqlite3"
-    auth0_database = tmp_path / "auth0.sqlite3"
+    oidc_database = tmp_path / "oidc.sqlite3"
 
     production = run_admin("fixtures", production_database, app_env="production")
-    auth0 = run_admin("fixtures", auth0_database, auth_mode="auth0")
+    oidc = run_admin("fixtures", oidc_database, auth_mode="oidc")
 
     assert production.returncode != 0
-    assert auth0.returncode != 0
+    assert oidc.returncode != 0
     assert not production_database.exists()
-    assert not auth0_database.exists()
+    assert not oidc_database.exists()

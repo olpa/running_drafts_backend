@@ -41,11 +41,10 @@ def test_deployment_compose_uses_tagged_image_loopback_and_host_storage(
         "APP_ENV": "production",
         "ALLOWED_ORIGINS": json.dumps(["https://drafts.handsfree.vc"]),
         "BACKUP_DIRECTORY": str(tmp_path / "backups"),
-        "BASIC_AUTH_PASSWORD": "deployment-only",
-        "BASIC_AUTH_USERNAMES": json.dumps(["bootstrap"]),
         "DATA_DIRECTORY": str(tmp_path / "data"),
         "HTTP_PORT": "18082",
         "IMAGE_TAG": "0.1.0",
+        "PUBLIC_EDITOR_URL": "https://drafts.handsfree.vc",
     }
     result = subprocess.run(
         [
@@ -92,3 +91,7 @@ def test_deployment_compose_uses_tagged_image_loopback_and_host_storage(
         str(tmp_path / "backups"),
         str(tmp_path / "data"),
     }
+    api_environment = configuration["services"]["api"]["environment"]
+    assert api_environment["AUTH_MODE"] == "oidc"
+    assert api_environment["PUBLIC_EDITOR_URL"] == "https://drafts.handsfree.vc"
+    assert api_environment["SESSION_COOKIE_SECURE"] == "true"

@@ -43,16 +43,15 @@ def test_liveness_does_not_access_a_missing_database(tmp_path: Path) -> None:
     assert not database_path.exists()
 
 
-def test_production_health_is_public_with_basic_auth(tmp_path: Path) -> None:
+def test_production_health_is_public_with_oidc(tmp_path: Path) -> None:
     database_path = tmp_path / "application.sqlite3"
     migrate_database(database_path)
     settings = Settings(
         app_env=AppEnvironment.PRODUCTION,
-        auth_mode=AuthMode.BASIC,
+        auth_mode=AuthMode.OIDC,
         database_path=database_path,
         allowed_origins=["https://drafts.handsfree.vc"],
-        basic_auth_usernames=["operator"],
-        basic_auth_password="production-password",
+        public_editor_url="https://drafts.handsfree.vc",
     )
 
     with TestClient(create_app(settings)) as client:

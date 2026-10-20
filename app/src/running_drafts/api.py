@@ -1,6 +1,9 @@
 import logging
 import sqlite3
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
+from typing import Any
+from uuid import uuid4
 
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -8,9 +11,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from running_drafts.auth import ensure_authentication_adapter_is_available
+from running_drafts.auth import SESSION_COOKIE_NAME, ensure_authentication_adapter_is_available
+from running_drafts.auth_routes import router as auth_router
 from running_drafts.database import DatabaseConfigurationError, existing_connection
 from running_drafts.migrations import MIGRATION_HEAD
+from running_drafts.oauth import ProviderRegistry, create_provider_registry
 from running_drafts.problems import ProblemException, problem_response
 from running_drafts.project_api import (
     ConcurrentDownloadLimitExceeded,
@@ -37,6 +42,35 @@ class SchemaVersionMismatch(RuntimeError):
     pass
 
 
+class CookieOriginMiddleware:
+    def __init__(self, app: Callable[..., Awaitable[None]], allowed_origins: list[str]) -> None:
+        self.app = app
+        self.allowed_origins = frozenset(allowed_origins)
+
+    async def __call__(
+        self,
+        scope: dict[str, Any],
+        receive: Callable[..., Awaitable[dict[str, Any]]],
+        send: Callable[..., Awaitable[None]],
+    ) -> None:
+        if scope["type"] == "http":
+            request = Request(scope)
+            if (
+                request.method not in {"GET", "HEAD", "OPTIONS", "TRACE"}
+                and SESSION_COOKIE_NAME in request.cookies
+                and request.headers.get("Origin") not in self.allowed_origins
+            ):
+                response = problem_response(
+                    status=403,
+                    title="Cross-site request rejected",
+                    detail="The request origin is not allowed.",
+                    code="csrf_rejected",
+                )
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
 def _database_is_ready(settings: Settings) -> None:
     with existing_connection(
         settings.database_path,
@@ -50,7 +84,11 @@ def _database_is_ready(settings: Settings) -> None:
             )
 
 
-def create_app(settings: Settings) -> FastAPI:
+def create_app(
+    settings: Settings,
+    *,
+    provider_registry: ProviderRegistry | None = None,
+) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         ensure_authentication_adapter_is_available(settings)
@@ -64,6 +102,7 @@ def create_app(settings: Settings) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.settings = settings
+    app.state.provider_registry = provider_registry or create_provider_registry(settings)
     app.state.download_capacity = DownloadCapacity(settings.max_staged_download_files)
     app.add_middleware(
         CORSMiddleware,
@@ -73,6 +112,7 @@ def create_app(settings: Settings) -> FastAPI:
         allow_headers=["*"],
         expose_headers=["Content-Disposition"],
     )
+    app.add_middleware(CookieOriginMiddleware, allowed_origins=settings.allowed_origins)
 
     @app.exception_handler(ProblemException)
     def handle_problem(_request: Request, error: ProblemException) -> JSONResponse:
@@ -247,8 +287,10 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.exception_handler(Exception)
     def handle_unexpected_error(_request: Request, error: Exception) -> JSONResponse:
+        reference_id = str(uuid4())
         logger.error(
-            "unhandled application exception",
+            "unhandled application exception referenceId=%s",
+            reference_id,
             exc_info=(type(error), error, error.__traceback__),
         )
         return problem_response(
@@ -256,6 +298,7 @@ def create_app(settings: Settings) -> FastAPI:
             title="Internal server error",
             detail="The server could not complete the request.",
             code="internal_error",
+            extensions={"referenceId": reference_id},
         )
 
     health = APIRouter(prefix="/health", tags=["health"])
@@ -284,5 +327,6 @@ def create_app(settings: Settings) -> FastAPI:
         return {"status": "ok"}
 
     app.include_router(health)
+    app.include_router(auth_router)
     app.include_router(project_router)
     return app

@@ -22,11 +22,10 @@ def settings_for(database_path: Path, environment: AppEnvironment) -> Settings:
     if environment is AppEnvironment.PRODUCTION:
         return Settings(
             app_env=environment,
-            auth_mode=AuthMode.AUTH0,
+            auth_mode=AuthMode.OIDC,
             database_path=database_path,
             allowed_origins=["https://editor.example"],
-            basic_auth_usernames=["test-user"],
-            basic_auth_password="unused",
+            public_editor_url="https://editor.example",
         )
     return Settings(
         app_env=environment,
@@ -142,7 +141,10 @@ def test_unexpected_failures_use_problem_details(tmp_path: Path) -> None:
 
     assert response.status_code == 500
     assert response.headers["content-type"] == "application/problem+json"
-    assert response.json() == {
+    body = response.json()
+    reference_id = body.pop("referenceId")
+    assert reference_id
+    assert body == {
         "type": "about:blank",
         "title": "Internal server error",
         "status": 500,
