@@ -13,7 +13,13 @@ from pathlib import Path
 from typing import BinaryIO, Literal
 from uuid import UUID, uuid4
 
-from running_drafts.database import DatabaseConfigurationError, existing_connection
+from running_drafts.database import (
+    DatabaseBusy,
+    DatabaseConfigurationError,
+    DatabaseUnavailable,
+    existing_connection,
+    is_busy_error,
+)
 
 CANONICAL_MEDIA_TYPE = "audio/webm;codecs=opus"
 SealReason = Literal["completed", "interrupted"]
@@ -77,14 +83,6 @@ class TemporaryFileFailure(RuntimeError):
 
 
 class FrameConflict(Exception):
-    pass
-
-
-class DatabaseBusy(Exception):
-    pass
-
-
-class DatabaseUnavailable(Exception):
     pass
 
 
@@ -219,11 +217,6 @@ def _assembly_failure(
     )
 
 
-def _is_busy(error: sqlite3.OperationalError) -> bool:
-    code = getattr(error, "sqlite_errorcode", None)
-    return code is not None and code & 0xFF in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
-
-
 class ProjectStorage:
     def __init__(
         self,
@@ -250,7 +243,7 @@ class ProjectStorage:
                 connection.row_factory = sqlite3.Row
                 yield connection
         except sqlite3.OperationalError as error:
-            if _is_busy(error):
+            if is_busy_error(error):
                 raise DatabaseBusy from error
             raise DatabaseUnavailable from error
         except sqlite3.IntegrityError:

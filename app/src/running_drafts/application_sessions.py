@@ -26,6 +26,37 @@ def _digest(token: str) -> bytes:
     return hashlib.sha256(token.encode("utf-8")).digest()
 
 
+def insert_application_session(
+    connection: sqlite3.Connection,
+    account_id: UUID,
+    *,
+    created_at_ms: int,
+) -> IssuedApplicationSession:
+    expires_at_ms = created_at_ms + SESSION_LIFETIME_MS
+    connection.execute(
+        "DELETE FROM application_sessions WHERE expires_at_ms <= ?",
+        (created_at_ms,),
+    )
+    while True:
+        token = secrets.token_urlsafe(32)
+        try:
+            connection.execute(
+                """
+                INSERT INTO application_sessions (
+                    token_digest, account_id, created_at_ms, expires_at_ms
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (_digest(token), str(account_id), created_at_ms, expires_at_ms),
+            )
+        except sqlite3.IntegrityError:
+            continue
+        return IssuedApplicationSession(
+            token=token,
+            account_id=account_id,
+            expires_at_ms=expires_at_ms,
+        )
+
+
 def resolve_application_session(
     settings: Settings,
     token: str | None,
@@ -63,7 +94,6 @@ def replace_application_session(
     now_ms: int | None = None,
 ) -> IssuedApplicationSession:
     created_at_ms = clock.utc_milliseconds() if now_ms is None else now_ms
-    expires_at_ms = created_at_ms + SESSION_LIFETIME_MS
     with existing_connection(
         settings.database_path,
         busy_timeout_ms=settings.database_busy_timeout_ms,
@@ -75,33 +105,16 @@ def replace_application_session(
                     "DELETE FROM application_sessions WHERE token_digest = ?",
                     (_digest(previous_token),),
                 )
-            connection.execute(
-                "DELETE FROM application_sessions WHERE expires_at_ms <= ?",
-                (created_at_ms,),
+            issued = insert_application_session(
+                connection,
+                account_id,
+                created_at_ms=created_at_ms,
             )
-            while True:
-                token = secrets.token_urlsafe(32)
-                try:
-                    connection.execute(
-                        """
-                        INSERT INTO application_sessions (
-                            token_digest, account_id, created_at_ms, expires_at_ms
-                        ) VALUES (?, ?, ?, ?)
-                        """,
-                        (_digest(token), str(account_id), created_at_ms, expires_at_ms),
-                    )
-                except sqlite3.IntegrityError:
-                    continue
-                break
             connection.commit()
         except BaseException:
             connection.rollback()
             raise
-    return IssuedApplicationSession(
-        token=token,
-        account_id=account_id,
-        expires_at_ms=expires_at_ms,
-    )
+    return issued
 
 
 def end_application_session(settings: Settings, token: str | None) -> None:

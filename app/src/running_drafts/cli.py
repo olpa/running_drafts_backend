@@ -8,11 +8,9 @@ import uvicorn
 from pydantic import ValidationError
 
 from running_drafts.api import create_app
-from running_drafts.auth import ensure_authentication_adapter_is_available
-from running_drafts.fixtures import FixtureError, create_fixtures
 from running_drafts.maintenance import MaintenanceError, incremental_vacuum
 from running_drafts.migrations import MigrationError, migrate
-from running_drafts.settings import DatabaseSettings, FixtureSettings, Settings
+from running_drafts.settings import DatabaseSettings, Settings
 from running_drafts.structured_logging import LOGGING_CONFIG, write_event
 
 
@@ -20,7 +18,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="running-drafts")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("migrate")
-    commands.add_parser("fixtures")
     vacuum = commands.add_parser("incremental-vacuum")
     vacuum.add_argument("--pages", type=int, default=1_000)
     commands.add_parser("serve")
@@ -34,10 +31,6 @@ def run(argv: Sequence[str] | None = None) -> int:
             version = migrate(DatabaseSettings())
             write_event("database_migrated", schema_version=version)
             return 0
-        if arguments.command == "fixtures":
-            inserted = create_fixtures(FixtureSettings())
-            write_event("fixtures_created", insertedUsers=inserted)
-            return 0
         if arguments.command == "incremental-vacuum":
             result = incremental_vacuum(DatabaseSettings(), pages=arguments.pages)
             write_event(
@@ -49,7 +42,6 @@ def run(argv: Sequence[str] | None = None) -> int:
             return 0
         if arguments.command == "serve":
             settings = Settings()
-            ensure_authentication_adapter_is_available(settings)
             uvicorn.run(
                 create_app(settings),
                 host=settings.server_host,
@@ -59,7 +51,6 @@ def run(argv: Sequence[str] | None = None) -> int:
             )
             return 0
     except (
-        FixtureError,
         MaintenanceError,
         MigrationError,
         RuntimeError,

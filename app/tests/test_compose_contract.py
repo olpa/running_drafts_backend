@@ -9,10 +9,8 @@ APP_DIRECTORY = Path(__file__).parents[1]
 def test_compose_publishes_separate_api_and_database_admin_services() -> None:
     environment = os.environ | {
         "APP_ENV": "development",
-        "AUTH_MODE": "basic",
         "ALLOWED_ORIGINS": json.dumps(["http://localhost:5173"]),
-        "BASIC_AUTH_USERNAMES": json.dumps(["developer"]),
-        "BASIC_AUTH_PASSWORD": "development-only",
+        "PUBLIC_EDITOR_URL": "http://localhost:5173",
     }
     result = subprocess.run(
         ["docker", "compose", "--profile", "tools", "config", "--format", "json"],
@@ -31,6 +29,13 @@ def test_compose_publishes_separate_api_and_database_admin_services() -> None:
     assert "application-data" in configuration["volumes"]
     assert configuration["services"]["api"]["build"]["target"] == "api"
     assert configuration["services"]["api"]["environment"]["MAX_STAGED_DOWNLOAD_FILES"] == "20"
+    assert configuration["services"]["api"]["environment"][
+        "TEST_CONTROL_BOOTSTRAP_CREDENTIAL"
+    ] == ""
+    assert configuration["services"]["api"]["environment"]["TEST_CONTROL_DERIVATION_KEY"] == ""
+    assert "TEST_CONTROL_BOOTSTRAP_CREDENTIAL" not in configuration["services"]["db-admin"][
+        "environment"
+    ]
     assert configuration["services"]["db-admin"]["build"]["target"] == "db-admin"
 
 
@@ -92,6 +97,7 @@ def test_deployment_compose_uses_tagged_image_loopback_and_host_storage(
         str(tmp_path / "data"),
     }
     api_environment = configuration["services"]["api"]["environment"]
-    assert api_environment["AUTH_MODE"] == "oidc"
+    assert "AUTH_MODE" not in api_environment
+    assert "BASIC_AUTH_USERNAMES" not in api_environment
     assert api_environment["PUBLIC_EDITOR_URL"] == "https://drafts.handsfree.vc"
     assert api_environment["SESSION_COOKIE_SECURE"] == "true"

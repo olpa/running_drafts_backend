@@ -11,9 +11,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from running_drafts.auth import SESSION_COOKIE_NAME, ensure_authentication_adapter_is_available
+from running_drafts.auth import SESSION_COOKIE_NAME
 from running_drafts.auth_routes import router as auth_router
-from running_drafts.database import DatabaseConfigurationError, existing_connection
+from running_drafts.database import (
+    DatabaseBusy,
+    DatabaseConfigurationError,
+    DatabaseUnavailable,
+    existing_connection,
+)
 from running_drafts.migrations import MIGRATION_HEAD
 from running_drafts.oauth import ProviderRegistry, create_provider_registry
 from running_drafts.problems import ProblemException, problem_response
@@ -26,14 +31,13 @@ from running_drafts.project_storage import (
     AudioAssemblyFailure,
     AudioAssetNotSealed,
     AudioAssetSealConflict,
-    DatabaseBusy,
-    DatabaseUnavailable,
     DownloadStorageUnavailable,
     FrameConflict,
     IdempotencyKeyReused,
     ResourceNotFound,
 )
 from running_drafts.settings import AppEnvironment, Settings
+from running_drafts.test_control import CONTROL_PREFIX, create_test_control_router
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +61,7 @@ class CookieOriginMiddleware:
             request = Request(scope)
             if (
                 request.method not in {"GET", "HEAD", "OPTIONS", "TRACE"}
+                and not request.url.path.startswith(f"{CONTROL_PREFIX}/")
                 and SESSION_COOKIE_NAME in request.cookies
                 and request.headers.get("Origin") not in self.allowed_origins
             ):
@@ -91,7 +96,6 @@ def create_app(
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        ensure_authentication_adapter_is_available(settings)
         yield
 
     documentation_url = "/docs" if settings.expose_api_documentation else None
@@ -104,6 +108,16 @@ def create_app(
     app.state.settings = settings
     app.state.provider_registry = provider_registry or create_provider_registry(settings)
     app.state.download_capacity = DownloadCapacity(settings.max_staged_download_files)
+    if settings.test_control_enabled:
+        app.include_router(create_test_control_router(settings))
+        logger.info("test control enabled")
+    else:
+        absent = []
+        if settings.test_control_bootstrap_credential is None:
+            absent.append("TEST_CONTROL_BOOTSTRAP_CREDENTIAL")
+        if settings.test_control_derivation_key is None:
+            absent.append("TEST_CONTROL_DERIVATION_KEY")
+        logger.warning("test control disabled missing_settings=%s", ",".join(absent))
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.allowed_origins,
@@ -121,6 +135,7 @@ def create_app(
             title=error.title,
             detail=error.detail,
             code=error.code,
+            extensions=error.extensions,
             headers=error.headers,
         )
 
