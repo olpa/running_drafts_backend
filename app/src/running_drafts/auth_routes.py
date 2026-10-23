@@ -10,7 +10,6 @@ from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import RedirectResponse, Response
 
 from running_drafts.application_sessions import (
-    SESSION_LIFETIME_MS,
     end_application_session,
     replace_application_session,
     resolve_application_session,
@@ -32,6 +31,7 @@ from running_drafts.oauth_transactions import (
     delete_login_attempt,
 )
 from running_drafts.problems import ProblemException, problem_response
+from running_drafts.session_cookie import clear_session_cookie, set_session_cookie
 from running_drafts.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -156,34 +156,6 @@ def _log_unexpected_authentication_failure(
             "category": "unexpected_exception",
             "referenceId": reference_id,
         },
-    )
-
-
-def _set_session_cookie(
-    response: Response,
-    settings: Settings,
-    token: str,
-    expires: datetime,
-) -> None:
-    response.set_cookie(
-        SESSION_COOKIE_NAME,
-        token,
-        max_age=SESSION_LIFETIME_MS // 1_000,
-        expires=expires,
-        path="/",
-        secure=settings.session_cookie_secure,
-        httponly=True,
-        samesite="lax",
-    )
-
-
-def _clear_session_cookie(response: Response, settings: Settings) -> None:
-    response.delete_cookie(
-        SESSION_COOKIE_NAME,
-        path="/",
-        secure=settings.session_cookie_secure,
-        httponly=True,
-        samesite="lax",
     )
 
 
@@ -375,7 +347,7 @@ async def oidc_callback(provider: str, request: Request) -> Response:
                     _editor_redirect(settings, attempt.return_to),
                     status_code=303,
                 )
-                _set_session_cookie(response, settings, issued.token, expires)
+                set_session_cookie(response, settings, issued.token, expires)
                 logger.info(
                     "OIDC login completed provider=%s account_id=%s",
                     provider,
@@ -390,7 +362,7 @@ def logout(request: Request) -> Response:
     settings = _settings(request)
     end_application_session(settings, request.cookies.get(SESSION_COOKIE_NAME))
     response = Response(status_code=204)
-    _clear_session_cookie(response, settings)
+    clear_session_cookie(response, settings)
     return response
 
 

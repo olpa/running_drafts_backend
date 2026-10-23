@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 
 from running_drafts.api import create_app
 from running_drafts.models import UUID4, CamelCaseRequest, CamelCaseResponse
-from running_drafts.settings import AppEnvironment, AuthMode, Settings
+from running_drafts.settings import AppEnvironment, Settings
 
 
 class ExampleRequest(CamelCaseRequest):
@@ -19,21 +19,12 @@ class ExampleResponse(CamelCaseResponse):
 
 
 def settings_for(database_path: Path, environment: AppEnvironment) -> Settings:
-    if environment is AppEnvironment.PRODUCTION:
-        return Settings(
-            app_env=environment,
-            auth_mode=AuthMode.OIDC,
-            database_path=database_path,
-            allowed_origins=["https://editor.example"],
-            public_editor_url="https://editor.example",
-        )
+    origin = "https://editor.example" if environment is AppEnvironment.PRODUCTION else "https://editor.test"
     return Settings(
         app_env=environment,
-        auth_mode=AuthMode.BASIC,
         database_path=database_path,
-        allowed_origins=["https://editor.test"],
-        basic_auth_usernames=["test-user"],
-        basic_auth_password="test-password",
+        allowed_origins=[origin],
+        public_editor_url=origin,
     )
 
 

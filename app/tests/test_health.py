@@ -7,17 +7,15 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from running_drafts.api import create_app
-from running_drafts.settings import AppEnvironment, AuthMode, Settings
+from running_drafts.settings import AppEnvironment, Settings
 
 
 def make_settings(database_path: Path) -> Settings:
     return Settings(
         app_env=AppEnvironment.TEST,
-        auth_mode=AuthMode.BASIC,
         database_path=database_path,
         allowed_origins=["https://editor.test"],
-        basic_auth_usernames=["alice"],
-        basic_auth_password="test-password",
+        public_editor_url="https://editor.test",
     )
 
 
@@ -48,7 +46,6 @@ def test_production_health_is_public_with_oidc(tmp_path: Path) -> None:
     migrate_database(database_path)
     settings = Settings(
         app_env=AppEnvironment.PRODUCTION,
-        auth_mode=AuthMode.OIDC,
         database_path=database_path,
         allowed_origins=["https://drafts.handsfree.vc"],
         public_editor_url="https://drafts.handsfree.vc",

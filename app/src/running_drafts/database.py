@@ -8,6 +8,19 @@ class DatabaseConfigurationError(RuntimeError):
     """The configured database cannot satisfy application invariants."""
 
 
+class DatabaseBusy(Exception):
+    """The database did not become writable before its configured timeout."""
+
+
+class DatabaseUnavailable(Exception):
+    """The database could not satisfy an application operation."""
+
+
+def is_busy_error(error: sqlite3.OperationalError) -> bool:
+    code = getattr(error, "sqlite_errorcode", None)
+    return code is not None and code & 0xFF in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+
+
 def _existing_database_uri(path: Path) -> str:
     return f"{path.resolve().as_uri()}?mode=rw"
 

@@ -7,14 +7,11 @@ from the Whisper service in `../inference`.
 
 - Docker with Compose, or Python 3.15 and `uv`
 - FFmpeg and FFprobe for the browser WebM/Opus evidence tests
-- Explicit configuration; copy `.env.example` to `.env` and replace the
-  development password before using Compose
+- Explicit configuration; copy `.env.example` to `.env` before using Compose
 
-`APP_ENV` must be `development`, `test`, or `production`. `AUTH_MODE=oidc`
-enables browser Application Sessions and is required in production.
-`AUTH_MODE=basic` remains temporarily available only in development and test for
-offline fixtures; it is removed separately by backend issue #27. CORS origins
-and Basic usernames are JSON arrays. CORS wildcards are rejected.
+`APP_ENV` must be `development`, `test`, or `production`. Protected APIs always
+use browser Application Sessions. CORS origins are a JSON array and wildcards
+are rejected.
 `MAX_TRANSPORT_FRAME_BYTES` bounds each streamed audio frame and defaults to
 2097152 bytes (2 MiB).
 `MAX_STAGED_DOWNLOAD_FILES` bounds concurrent audio downloads per application
@@ -22,7 +19,7 @@ process and defaults to 20.
 
 ## Browser authentication
 
-OIDC mode accepts `PUBLIC_EDITOR_URL`, `GOOGLE_CLIENT_ID`,
+Browser authentication accepts `PUBLIC_EDITOR_URL`, `GOOGLE_CLIENT_ID`,
 `GOOGLE_CLIENT_SECRET`, and optional `GOOGLE_REDIRECT_URI`. Supplying only one
 Google credential is a startup error; supplying neither disables Google and
 omits it from `GET /api/v1/auth/providers`. Development and production must use
@@ -56,14 +53,37 @@ confirm protected requests return `401 authentication_required`. Repeat login
 and confirm it resolves the same Account. Do not record tokens, cookies, codes,
 claims, credentials, or provider response bodies as evidence.
 
+## Online fixture control
+
+The optional test-control API is available in any environment only when both
+`TEST_CONTROL_BOOTSTRAP_CREDENTIAL` and `TEST_CONTROL_DERIVATION_KEY` are
+nonempty. With either absent, its routes are not registered. Enabling it in a
+deployed environment is an explicit operator decision.
+
+A trusted provisioning client authenticates to
+`GET /api/v1/test-control/challenge` with the bootstrap Bearer credential. It
+validates `hmac-sha256` and context `running-drafts:test-control:v1:`, then
+derives an instance token from the UTF-8 derivation key and decoded challenge.
+It sends that token as `X-Test-Control` to synchronous
+`POST /api/v1/test-control/reset` and `POST /api/v1/test-control/create` calls.
+The challenge and derived token change after every API-process restart.
+
+Reset transactionally deletes only the fixed fixture Account and its cascaded
+state. Create restores its canonical identity and sets the normal
+`running_drafts_session` HttpOnly cookie. Neither endpoint is an alternate
+authentication mechanism for application resources. The product sandbox
+manager owns the exchange for local E2E sandboxes; pytest reads only its
+protected ready-to-send headers file. The product integration sequence and
+consumer responsibilities are recorded in the
+[test-control E2E handover](../docs/test-control-e2e-handover.md).
+
 ## Docker Compose workflow
 
-Database creation, fixtures, and API startup are intentionally separate:
+Database migration and API startup are intentionally separate:
 
 ```bash
 cp .env.example .env
 docker compose run --rm --build db-admin migrate
-docker compose run --rm db-admin fixtures
 docker compose up --build api
 ```
 
@@ -84,7 +104,6 @@ and run the same explicit sequence:
 ```bash
 uv sync --frozen
 uv run running-drafts migrate
-uv run running-drafts fixtures
 uv run running-drafts serve
 ```
 
@@ -114,10 +133,10 @@ uv run pytest
 ```
 
 The suite uses named temporary SQLite files and the real connection, migration,
-fixture, authentication, and readiness paths. Container smoke verification also
+test-control, authentication, and readiness paths. Container smoke verification also
 requires access to the Docker daemon.
 
-Run the opt-in image build, named-volume, migration, fixture, health, and restart
+Run the opt-in image build, named-volume, migration, test-control, health, and restart
 smoke test with:
 
 ```bash

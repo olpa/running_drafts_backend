@@ -1,3 +1,6 @@
+import base64
+import hashlib
+import hmac
 import json
 import os
 import subprocess
@@ -13,9 +16,16 @@ APP_DIRECTORY = Path(__file__).parents[1]
 RUN_CONTAINER_TESTS = os.environ.get("RUN_CONTAINER_TESTS") == "1"
 
 
-def request_json(url: str, *, expected_status: int = 200) -> dict[str, str]:
+def request_json(
+    url: str,
+    *,
+    expected_status: int = 200,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+) -> dict[str, str]:
+    request = urllib.request.Request(url, method=method, headers=headers or {})
     try:
-        with urllib.request.urlopen(url, timeout=2) as response:
+        with urllib.request.urlopen(request, timeout=2) as response:
             assert response.status == expected_status
             return json.load(response)
     except urllib.error.HTTPError as error:
@@ -32,16 +42,17 @@ def last_json_event(output: str) -> dict[str, object]:
 
 @pytest.mark.container
 @pytest.mark.skipif(not RUN_CONTAINER_TESTS, reason="set RUN_CONTAINER_TESTS=1")
-def test_compose_migrates_seeds_serves_and_restarts() -> None:
+def test_compose_migrates_serves_controls_and_restarts() -> None:
     project = f"running_drafts_smoke_{uuid4().hex[:12]}"
     environment = os.environ | {
         "COMPOSE_PROJECT_NAME": project,
         "API_PORT": "0",
         "APP_ENV": "development",
-        "AUTH_MODE": "basic",
         "ALLOWED_ORIGINS": json.dumps(["http://localhost:5173"]),
-        "BASIC_AUTH_USERNAMES": json.dumps(["developer"]),
-        "BASIC_AUTH_PASSWORD": "container-smoke-only",
+        "PUBLIC_EDITOR_URL": "http://localhost:5173",
+        "SESSION_COOKIE_SECURE": "false",
+        "TEST_CONTROL_BOOTSTRAP_CREDENTIAL": "container-bootstrap",
+        "TEST_CONTROL_DERIVATION_KEY": "container-derivation",
     }
 
     def compose(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -70,22 +81,60 @@ def test_compose_migrates_seeds_serves_and_restarts() -> None:
         port = int(published.rsplit(":", 1)[1])
         return f"http://127.0.0.1:{port}"
 
+    def control_headers(base_url: str) -> dict[str, str]:
+        challenge = request_json(
+            f"{base_url}/api/v1/test-control/challenge",
+            headers={"Authorization": "Bearer container-bootstrap"},
+        )
+        assert challenge["derivation"] == "hmac-sha256"
+        assert challenge["context"] == "running-drafts:test-control:v1:"
+        challenge_bytes = base64.urlsafe_b64decode(challenge["challenge"] + "==")
+        token = base64.urlsafe_b64encode(
+            hmac.new(
+                b"container-derivation",
+                b"running-drafts:test-control:v1:" + challenge_bytes,
+                hashlib.sha256,
+            ).digest()
+        ).rstrip(b"=").decode("ascii")
+        return {"X-Test-Control": token}
+
     try:
         migrated = compose("run", "--rm", "--build", "db-admin", "migrate")
-        fixtures = compose("run", "--rm", "db-admin", "fixtures")
         compose("up", "-d", "--build", "api")
         identity = compose("exec", "-T", "api", "id", "-u")
         base_url = api_base_url()
 
-        assert last_json_event(migrated.stdout)["schema_version"] == 3
-        assert last_json_event(fixtures.stdout)["insertedUsers"] == 1
+        assert last_json_event(migrated.stdout)["schema_version"] == 4
         assert identity.stdout.strip() == "1000"
         assert wait_for(f"{base_url}/health/live") == {"status": "ok"}
         assert wait_for(f"{base_url}/health/ready") == {"status": "ok"}
+        headers = control_headers(base_url)
+        assert request_json(
+            f"{base_url}/api/v1/test-control/reset",
+            method="POST",
+            headers=headers,
+        ) == {"status": "reset"}
+        created = request_json(
+            f"{base_url}/api/v1/test-control/create",
+            method="POST",
+            headers=headers,
+        )
+        assert created["status"] == "created"
 
         compose("restart", "api")
         base_url = api_base_url()
         assert wait_for(f"{base_url}/health/ready") == {"status": "ok"}
+        assert request_json(
+            f"{base_url}/api/v1/test-control/reset",
+            expected_status=401,
+            method="POST",
+            headers=headers,
+        )["code"] == "authentication_required"
+        assert request_json(
+            f"{base_url}/api/v1/test-control/reset",
+            method="POST",
+            headers=control_headers(base_url),
+        ) == {"status": "reset"}
     finally:
         compose("down", "-v", "--remove-orphans", check=False)
 

@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import errno
 import json
 import os
@@ -19,20 +18,22 @@ import pytest
 from fastapi.testclient import TestClient
 
 from running_drafts.api import create_app
+from running_drafts.application_sessions import replace_application_session
+from running_drafts.oauth import ProviderClaims
+from running_drafts.oauth_identities import resolve_or_provision_identity
 from running_drafts.project_api import project_storage
 from running_drafts.project_storage import ProjectStorage
-from running_drafts.settings import AppEnvironment, AuthMode, Settings
+from running_drafts.session_cookie import SESSION_COOKIE_NAME
+from running_drafts.settings import AppEnvironment, Settings
 
-PASSWORD = "shared-password"
 MEDIARECORDER_FIXTURES = Path(__file__).parent / "fixtures" / "mediarecorder"
+AUTH_TOKENS: dict[str, str] = {}
 
 
 def run_admin(command: str, database_path: Path) -> subprocess.CompletedProcess[str]:
     environment = os.environ | {
         "APP_ENV": "test",
-        "AUTH_MODE": "basic",
         "DATABASE_PATH": str(database_path),
-        "BASIC_AUTH_USERNAMES": json.dumps(["Alice", "Bob"]),
     }
     return subprocess.run(
         [sys.executable, "-m", "running_drafts", command],
@@ -46,12 +47,10 @@ def run_admin(command: str, database_path: Path) -> subprocess.CompletedProcess[
 def settings_for(database_path: Path) -> Settings:
     return Settings(
         app_env=AppEnvironment.TEST,
-        auth_mode=AuthMode.BASIC,
         database_path=database_path,
         database_busy_timeout_ms=100,
         allowed_origins=["https://editor.test"],
-        basic_auth_usernames=["Alice", "Bob"],
-        basic_auth_password=PASSWORD,
+        public_editor_url="https://editor.test",
     )
 
 
@@ -59,7 +58,22 @@ def settings_for(database_path: Path) -> Settings:
 def database_path(tmp_path: Path) -> Path:
     path = tmp_path / "application.sqlite3"
     assert run_admin("migrate", path).returncode == 0
-    assert run_admin("fixtures", path).returncode == 0
+    settings = settings_for(path)
+    AUTH_TOKENS.clear()
+    for username in ("Alice", "Bob"):
+        identity = resolve_or_provision_identity(
+            settings,
+            ProviderClaims(
+                provider="fixture",
+                issuer="urn:running-drafts:backend-tests",
+                subject=username.lower(),
+            ),
+        )
+        AUTH_TOKENS[username] = replace_application_session(
+            settings,
+            identity.account_id,
+            None,
+        ).token
     return path
 
 
@@ -69,8 +83,11 @@ def client(database_path: Path) -> Iterator[TestClient]:
         yield test_client
 
 
-def auth(username: str = "Alice") -> tuple[str, str]:
-    return username, PASSWORD
+def auth(username: str = "Alice") -> dict[str, str]:
+    return {
+        "Cookie": f"{SESSION_COOKIE_NAME}={AUTH_TOKENS[username]}",
+        "Origin": "https://editor.test",
+    }
 
 
 def create_project(
@@ -83,7 +100,7 @@ def create_project(
     response = client.post(
         "/api/v1/projects",
         json={"idempotencyKey": str(key or uuid4()), "title": title},
-        auth=auth(username),
+        headers=auth(username),
     )
     assert response.status_code == 201, response.text
     return response.json()
@@ -100,7 +117,7 @@ def create_section(
     response = client.post(
         f"/api/v1/projects/{project_id}/sections",
         json={"idempotencyKey": str(key or uuid4()), "mediaType": media_type},
-        auth=auth(username),
+        headers=auth(username),
     )
     return response.json(), response
 
@@ -119,20 +136,20 @@ def upload_frame(
     return client.put(
         f"/api/v1/audio-assets/{audio_asset_id}/frames/{sequence}",
         content=payload,
-        headers={
+        headers=auth(username)
+        | {
             "Content-Type": content_type,
             "X-Frame-Start-Ms": str(start_ms),
             "X-Frame-End-Ms": str(end_ms),
         },
-        auth=auth(username),
     )
 
 
 def user_id(database_path: Path, username: str) -> UUID:
     with sqlite3.connect(database_path) as connection:
         value = connection.execute(
-            "SELECT user_id FROM basic_auth_identities WHERE username = ?",
-            (username,),
+            "SELECT account_id FROM provider_identities WHERE issuer = ? AND subject = ?",
+            ("urn:running-drafts:backend-tests", username.lower()),
         ).fetchone()[0]
     return UUID(value)
 
@@ -154,35 +171,35 @@ def test_project_normalization_idempotency_rename_and_stable_list_order(
         created = test_client.post(
             "/api/v1/projects",
             json={"idempotencyKey": str(key), "title": "  Cafe\u0301 notes  "},
-            auth=auth(),
+            headers=auth(),
         )
         replay = test_client.post(
             "/api/v1/projects",
             json={"idempotencyKey": str(key), "title": "Café notes"},
-            auth=auth(),
+            headers=auth(),
         )
         conflict = test_client.post(
             "/api/v1/projects",
             json={"idempotencyKey": str(key), "title": "Different"},
-            auth=auth(),
+            headers=auth(),
         )
         renamed = test_client.patch(
             f"/api/v1/projects/{created.json()['id']}",
             json={"title": "Renamed"},
-            auth=auth(),
+            headers=auth(),
         )
         unchanged = test_client.patch(
             f"/api/v1/projects/{created.json()['id']}",
             json={"title": " Renamed "},
-            auth=auth(),
+            headers=auth(),
         )
         replay_after_rename = test_client.post(
             "/api/v1/projects",
             json={"idempotencyKey": str(key), "title": "Café notes"},
-            auth=auth(),
+            headers=auth(),
         )
         tied = create_project(test_client, title="Tied")
-        listed = test_client.get("/api/v1/projects", auth=auth())
+        listed = test_client.get("/api/v1/projects", headers=auth())
 
     assert created.headers["location"] == f"/api/v1/projects/{created.json()['id']}"
     assert created.json()["title"] == "Café notes"
@@ -205,7 +222,7 @@ def test_invalid_titles_use_problem_details(client: TestClient, title: str) -> N
     response = client.post(
         "/api/v1/projects",
         json={"idempotencyKey": str(uuid4()), "title": title},
-        auth=auth(),
+        headers=auth(),
     )
 
     assert response.status_code == 422
@@ -235,7 +252,7 @@ def test_section_creation_is_canonical_idempotent_and_visible_in_document(
         project["id"],
         media_type="audio/webm",
     )
-    detail = client.get(f"/api/v1/projects/{project['id']}", auth=auth())
+    detail = client.get(f"/api/v1/projects/{project['id']}", headers=auth())
 
     assert first.status_code == 201
     assert first.headers["location"] == f"/api/v1/projects/{project['id']}"
@@ -266,7 +283,7 @@ def test_audio_frame_upload_is_acknowledged_and_visible_in_project_detail(
     section, _response = create_section(client, project["id"])
 
     uploaded = upload_frame(client, section["audioAssetId"], 0)
-    detail = client.get(f"/api/v1/projects/{project['id']}", auth=auth())
+    detail = client.get(f"/api/v1/projects/{project['id']}", headers=auth())
 
     assert uploaded.status_code == 200, uploaded.text
     assert uploaded.json() == {
@@ -296,13 +313,13 @@ def test_audio_frame_upload_enforces_body_media_and_timing_rules(
         oversized = test_client.put(
             endpoint,
             content=b"123456789",
-            headers={
+            headers=auth()
+            | {
                 "Content-Type": "audio/webm;codecs=opus",
                 "Content-Length": "1",
                 "X-Frame-Start-Ms": "0",
                 "X-Frame-End-Ms": "1000",
             },
-            auth=auth(),
         )
         unsupported = upload_frame(
             test_client,
@@ -379,7 +396,7 @@ def test_audio_frame_http_replays_and_conflicts_follow_asset_state(
     sealed = client.post(
         f"/api/v1/audio-assets/{asset_id}/complete",
         json={"frameCount": 2},
-        auth=auth(),
+        headers=auth(),
     )
     replay_after_seal = upload_frame(client, asset_id, 0)
     new_after_seal = upload_frame(
@@ -408,11 +425,11 @@ def test_cross_user_access_is_privacy_preserving(client: TestClient) -> None:
     section, _response = create_section(client, project["id"])
 
     responses = [
-        client.get(f"/api/v1/projects/{project['id']}", auth=auth("Bob")),
+        client.get(f"/api/v1/projects/{project['id']}", headers=auth("Bob")),
         client.patch(
             f"/api/v1/projects/{project['id']}",
             json={"title": "Stolen"},
-            auth=auth("Bob"),
+            headers=auth("Bob"),
         ),
         client.post(
             f"/api/v1/projects/{project['id']}/sections",
@@ -420,11 +437,11 @@ def test_cross_user_access_is_privacy_preserving(client: TestClient) -> None:
                 "idempotencyKey": str(uuid4()),
                 "mediaType": "audio/webm;codecs=opus",
             },
-            auth=auth("Bob"),
+            headers=auth("Bob"),
         ),
         client.post(
             f"/api/v1/audio-assets/{section['audioAssetId']}/interrupt",
-            auth=auth("Bob"),
+            headers=auth("Bob"),
         ),
         upload_frame(
             client,
@@ -434,7 +451,7 @@ def test_cross_user_access_is_privacy_preserving(client: TestClient) -> None:
             username="Bob",
         ),
     ]
-    missing = client.get(f"/api/v1/projects/{uuid4()}", auth=auth("Bob"))
+    missing = client.get(f"/api/v1/projects/{uuid4()}", headers=auth("Bob"))
 
     assert {response.status_code for response in responses} == {404}
     assert {response.json()["code"] for response in responses} == {"resource_not_found"}
@@ -451,31 +468,31 @@ def test_zero_frame_sealing_is_idempotent_and_conflicts_are_stable(
     completed = client.post(
         f"/api/v1/audio-assets/{asset_id}/complete",
         json={"frameCount": 0},
-        auth=auth(),
+        headers=auth(),
     )
     replay = client.post(
         f"/api/v1/audio-assets/{asset_id}/complete",
         json={"frameCount": 0},
-        auth=auth(),
+        headers=auth(),
     )
     changed_count = client.post(
         f"/api/v1/audio-assets/{asset_id}/complete",
         json={"frameCount": 1},
-        auth=auth(),
+        headers=auth(),
     )
     opposite = client.post(
         f"/api/v1/audio-assets/{asset_id}/interrupt",
-        auth=auth(),
+        headers=auth(),
     )
 
     interrupted_section, _response = create_section(client, project["id"])
     interrupted = client.post(
         f"/api/v1/audio-assets/{interrupted_section['audioAssetId']}/interrupt",
-        auth=auth(),
+        headers=auth(),
     )
     interrupted_replay = client.post(
         f"/api/v1/audio-assets/{interrupted_section['audioAssetId']}/interrupt",
-        auth=auth(),
+        headers=auth(),
     )
 
     assert completed.status_code == 200
@@ -510,13 +527,13 @@ def test_sealed_audio_download_returns_exact_ordered_frames(client: TestClient) 
     sealed = client.post(
         f"/api/v1/audio-assets/{asset_id}/complete",
         json={"frameCount": 2},
-        auth=auth(),
+        headers=auth(),
     )
     assert sealed.status_code == 200
 
     downloaded = client.get(
         f"/api/v1/audio-assets/{asset_id}/download",
-        auth=auth(),
+        headers=auth(),
     )
 
     assert downloaded.status_code == 200
@@ -537,9 +554,9 @@ def test_audio_download_requires_authentication_ownership_and_sealing(
     endpoint = f"/api/v1/audio-assets/{section['audioAssetId']}/download"
 
     unauthenticated = client.get(endpoint)
-    open_asset = client.get(endpoint, auth=auth())
-    unowned = client.get(endpoint, auth=auth("Bob"))
-    missing = client.get(f"/api/v1/audio-assets/{uuid4()}/download", auth=auth("Bob"))
+    open_asset = client.get(endpoint, headers=auth())
+    unowned = client.get(endpoint, headers=auth("Bob"))
+    missing = client.get(f"/api/v1/audio-assets/{uuid4()}/download", headers=auth("Bob"))
 
     assert unauthenticated.status_code == 401
     assert open_asset.status_code == 409
@@ -557,7 +574,7 @@ def test_zero_frame_download_uses_empty_fixture_and_unicode_filename(
     sealed = client.post(
         f"/api/v1/audio-assets/{completed['audioAssetId']}/complete",
         json={"frameCount": 0},
-        auth=auth(),
+        headers=auth(),
     )
     assert sealed.status_code == 200
 
@@ -573,8 +590,7 @@ def test_zero_frame_download_uses_empty_fixture_and_unicode_filename(
     try:
         downloaded = client.get(
             f"/api/v1/audio-assets/{completed['audioAssetId']}/download",
-            auth=auth(),
-            headers={"Origin": "https://editor.test"},
+            headers=auth(),
         )
     finally:
         client.app.dependency_overrides.pop(project_storage)
@@ -602,14 +618,14 @@ def test_download_filename_preserves_suffix_within_utf8_length_limit(
     assert (
         client.post(
             f"/api/v1/audio-assets/{asset_id}/interrupt",
-            auth=auth(),
+            headers=auth(),
         ).status_code
         == 200
     )
 
     downloaded = client.get(
         f"/api/v1/audio-assets/{asset_id}/download",
-        auth=auth(),
+        headers=auth(),
     )
 
     encoded_name = downloaded.headers["content-disposition"].split("filename*=UTF-8''", 1)[1]
@@ -635,7 +651,7 @@ def test_inconsistent_audio_download_returns_bounded_assembly_failure(
         client.post(
             f"/api/v1/audio-assets/{asset_id}/complete",
             json={"frameCount": 1},
-            auth=auth(),
+            headers=auth(),
         ).status_code
         == 200
     )
@@ -648,7 +664,7 @@ def test_inconsistent_audio_download_returns_bounded_assembly_failure(
     with caplog.at_level("ERROR"):
         response = client.get(
             f"/api/v1/audio-assets/{asset_id}/download",
-            auth=auth(),
+            headers=auth(),
         )
 
     assert response.status_code == 500
@@ -675,7 +691,7 @@ def test_temporary_disk_exhaustion_returns_storage_unavailable(
         client.post(
             f"/api/v1/audio-assets/{asset_id}/complete",
             json={"frameCount": 1},
-            auth=auth(),
+            headers=auth(),
         ).status_code
         == 200
     )
@@ -692,7 +708,7 @@ def test_temporary_disk_exhaustion_returns_storage_unavailable(
     try:
         response = client.get(
             f"/api/v1/audio-assets/{asset_id}/download",
-            auth=auth(),
+            headers=auth(),
         )
     finally:
         client.app.dependency_overrides.pop(project_storage)
@@ -713,7 +729,7 @@ def test_download_capacity_rejects_before_staging_and_returns_after_streaming(
         client.post(
             f"/api/v1/audio-assets/{asset_id}/complete",
             json={"frameCount": 1},
-            auth=auth(),
+            headers=auth(),
         ).status_code
         == 200
     )
@@ -764,7 +780,7 @@ def test_download_capacity_rejects_before_staging_and_returns_after_streaming(
     with TestClient(app) as first_client, TestClient(app) as second_client:
         with ThreadPoolExecutor(max_workers=20) as executor:
             first_twenty = [
-                executor.submit(first_client.get, endpoint, auth=auth())
+                executor.submit(first_client.get, endpoint, headers=auth())
                 for _index in range(20)
             ]
             assert all_streams_started.wait(timeout=10)
@@ -773,7 +789,7 @@ def test_download_capacity_rejects_before_staging_and_returns_after_streaming(
             assert unauthenticated.status_code == 401
             rejected = second_client.get(
                 f"/api/v1/audio-assets/{uuid4()}/download",
-                auth=auth(),
+                headers=auth(),
             )
             assert rejected.status_code == 429
             assert rejected.json()["code"] == "concurrent_download_limit_exceeded"
@@ -785,7 +801,7 @@ def test_download_capacity_rejects_before_staging_and_returns_after_streaming(
                 200
             }
 
-        accepted_after_cleanup = second_client.get(endpoint, auth=auth())
+        accepted_after_cleanup = second_client.get(endpoint, headers=auth())
 
     assert accepted_after_cleanup.status_code == 200
     assert files_created == 21
@@ -804,7 +820,7 @@ def test_client_disconnect_closes_staged_file_and_releases_capacity(
         client.post(
             f"/api/v1/audio-assets/{asset_id}/complete",
             json={"frameCount": 1},
-            auth=auth(),
+            headers=auth(),
         ).status_code
         == 200
     )
@@ -841,7 +857,7 @@ def test_client_disconnect_closes_staged_file_and_releases_capacity(
         temporary_file_factory=temporary_file_factory,
     )
     endpoint = f"/api/v1/audio-assets/{asset_id}/download"
-    credentials = base64.b64encode(f"Alice:{PASSWORD}".encode()).decode()
+    session_cookie = f"{SESSION_COOKIE_NAME}={AUTH_TOKENS['Alice']}".encode()
 
     async def disconnect_during_stream() -> None:
         request_sent = False
@@ -871,7 +887,7 @@ def test_client_disconnect_closes_staged_file_and_releases_capacity(
                 "raw_path": endpoint.encode(),
                 "query_string": b"",
                 "root_path": "",
-                "headers": [(b"authorization", f"Basic {credentials}".encode())],
+                "headers": [(b"cookie", session_cookie)],
                 "client": ("testclient", 123),
                 "server": ("testserver", 80),
                 "state": {},
@@ -884,7 +900,7 @@ def test_client_disconnect_closes_staged_file_and_releases_capacity(
 
     assert staged_file_closed.wait(timeout=1)
     with TestClient(app) as retry_client:
-        retry = retry_client.get(endpoint, auth=auth())
+        retry = retry_client.get(endpoint, headers=auth())
     assert retry.status_code == 200
 
 
@@ -900,7 +916,7 @@ def test_disconnect_before_first_body_closes_file_and_releases_capacity(
         client.post(
             f"/api/v1/audio-assets/{asset_id}/complete",
             json={"frameCount": 1},
-            auth=auth(),
+            headers=auth(),
         ).status_code
         == 200
     )
@@ -939,7 +955,7 @@ def test_disconnect_before_first_body_closes_file_and_releases_capacity(
         temporary_file_factory=temporary_file_factory,
     )
     endpoint = f"/api/v1/audio-assets/{asset_id}/download"
-    credentials = base64.b64encode(f"Alice:{PASSWORD}".encode()).decode()
+    session_cookie = f"{SESSION_COOKIE_NAME}={AUTH_TOKENS['Alice']}".encode()
 
     async def disconnect_before_body() -> None:
         request_sent = False
@@ -968,7 +984,7 @@ def test_disconnect_before_first_body_closes_file_and_releases_capacity(
                 "raw_path": endpoint.encode(),
                 "query_string": b"",
                 "root_path": "",
-                "headers": [(b"authorization", f"Basic {credentials}".encode())],
+                "headers": [(b"cookie", session_cookie)],
                 "client": ("testclient", 123),
                 "server": ("testserver", 80),
                 "state": {},
@@ -982,7 +998,7 @@ def test_disconnect_before_first_body_closes_file_and_releases_capacity(
     assert not staged_file_read.is_set()
     assert staged_file_closed.wait(timeout=1)
     with TestClient(app) as retry_client:
-        retry = retry_client.get(endpoint, auth=auth())
+        retry = retry_client.get(endpoint, headers=auth())
     assert retry.status_code == 200
 
 
@@ -1021,18 +1037,18 @@ def test_real_browser_audio_download_is_the_exact_joined_stream(
         sealed = client.post(
             f"/api/v1/audio-assets/{asset_id}/complete",
             json={"frameCount": len(metadata["frames"])},
-            auth=auth(),
+            headers=auth(),
         )
     else:
         sealed = client.post(
             f"/api/v1/audio-assets/{asset_id}/interrupt",
-            auth=auth(),
+            headers=auth(),
         )
     assert sealed.status_code == 200
 
     downloaded = client.get(
         f"/api/v1/audio-assets/{asset_id}/download",
-        auth=auth(),
+        headers=auth(),
     )
 
     assert downloaded.status_code == 200
@@ -1047,9 +1063,9 @@ def test_completion_frame_count_requires_a_nonnegative_integer(client: TestClien
     endpoint = f"/api/v1/audio-assets/{section['audioAssetId']}/complete"
 
     responses = [
-        client.post(endpoint, json={"frameCount": True}, auth=auth()),
-        client.post(endpoint, json={"frameCount": -1}, auth=auth()),
-        client.post(endpoint, json={"frameCount": 0.0}, auth=auth()),
+        client.post(endpoint, json={"frameCount": True}, headers=auth()),
+        client.post(endpoint, json={"frameCount": -1}, headers=auth()),
+        client.post(endpoint, json={"frameCount": 0.0}, headers=auth()),
     ]
 
     assert {response.status_code for response in responses} == {422}
@@ -1145,7 +1161,7 @@ def test_busy_mutation_returns_retryable_problem_details(
             client.post(
                 "/api/v1/projects",
                 json={"idempotencyKey": str(uuid4()), "title": "Busy"},
-                auth=auth(),
+                headers=auth(),
             ),
             upload_frame(client, section["audioAssetId"], 0),
         ]
@@ -1184,7 +1200,7 @@ def test_failed_frame_transaction_is_not_acknowledged_and_can_be_retried(
             connection.execute("DROP TRIGGER reject_test_frame")
         retry = upload_frame(test_client, section["audioAssetId"], 0)
         replay = upload_frame(test_client, section["audioAssetId"], 0)
-        detail = test_client.get(f"/api/v1/projects/{project['id']}", auth=auth())
+        detail = test_client.get(f"/api/v1/projects/{project['id']}", headers=auth())
 
     assert failed.status_code == 500
     assert retry.status_code == 200

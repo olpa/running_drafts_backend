@@ -22,8 +22,7 @@ existing database, migrate explicitly, and start the target:
 /rnotes/RUNNING_DRAFTS_BACKEND/start-dev.sh
 ```
 
-Omit the backup only for the first migration of a new, empty target. Never run
-the `fixtures` command for these deployments.
+Omit the backup only for the first migration of a new, empty target.
 
 Development uses Compose project `running-drafts-backend-dev`, loopback HTTP
 port 18081, and `data-dev`. Production uses
@@ -45,6 +44,13 @@ Keep client secrets only in the target `.env.dev` and `.env.prod` files on the
 host; never copy them into the repository or logs. `/health/live` reports
 process health and `/health/ready` additionally requires the explicitly
 migrated SQLite database.
+
+Online fixture control is disabled unless both
+`TEST_CONTROL_BOOTSTRAP_CREDENTIAL` and `TEST_CONTROL_DERIVATION_KEY` are set in
+the selected target environment. This gate is environment-independent, so
+production can enable it deliberately. Treat both as deployment secrets. The
+challenge, derived `X-Test-Control` token, and resulting Application Session
+cookie must not appear in commands, logs, or retained evidence.
 
 Use `status-dev.sh` or `status-prod.sh` for local readiness, and pass normal
 Compose log options to `logs-dev.sh` or `logs-prod.sh`. `backup-dev.sh` and

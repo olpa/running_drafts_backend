@@ -23,6 +23,7 @@ class ProblemException(Exception):
         detail: str,
         code: str,
         headers: dict[str, str] | None = None,
+        extensions: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(detail)
         self.status = status
@@ -30,6 +31,7 @@ class ProblemException(Exception):
         self.detail = detail
         self.code = code
         self.headers = headers
+        self.extensions = extensions
 
 
 def problem_response(

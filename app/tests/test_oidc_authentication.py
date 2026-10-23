@@ -40,7 +40,7 @@ from running_drafts.oauth_transactions import (
     LOGIN_ATTEMPT_LIFETIME_MS,
     create_login_attempt,
 )
-from running_drafts.settings import AppEnvironment, AuthMode, DatabaseSettings, Settings
+from running_drafts.settings import AppEnvironment, DatabaseSettings, Settings
 from running_drafts.structured_logging import JsonFormatter
 
 
@@ -90,7 +90,6 @@ class FakeGoogleProvider:
 def oidc_settings(database_path: Path, **overrides: object) -> Settings:
     values = {
         "app_env": AppEnvironment.TEST,
-        "auth_mode": AuthMode.OIDC,
         "database_path": database_path,
         "allowed_origins": ["https://editor.test"],
         "public_editor_url": "https://editor.test",
@@ -170,7 +169,6 @@ def test_oidc_configuration_absent_complete_partial_and_redacted(tmp_path: Path)
     with pytest.raises(ValidationError):
         Settings(
             app_env=AppEnvironment.PRODUCTION,
-            auth_mode=AuthMode.OIDC,
             database_path=database_path,
             allowed_origins=["https://editor.test"],
             public_editor_url="https://editor.test",

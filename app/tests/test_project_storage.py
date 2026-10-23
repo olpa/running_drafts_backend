@@ -1,5 +1,4 @@
 import hashlib
-import json
 import os
 import sqlite3
 import subprocess
@@ -20,13 +19,16 @@ from running_drafts.project_storage import (
     ResourceNotFound,
 )
 
+USER_IDS = {
+    "Alice": UUID("00000000-0000-4000-8000-000000000001"),
+    "Bob": UUID("00000000-0000-4000-8000-000000000002"),
+}
+
 
 def run_admin(command: str, database_path: Path) -> subprocess.CompletedProcess[str]:
     environment = os.environ | {
         "APP_ENV": "test",
-        "AUTH_MODE": "basic",
         "DATABASE_PATH": str(database_path),
-        "BASIC_AUTH_USERNAMES": json.dumps(["Alice", "Bob"]),
     }
     return subprocess.run(
         [sys.executable, "-m", "running_drafts", command],
@@ -40,17 +42,17 @@ def run_admin(command: str, database_path: Path) -> subprocess.CompletedProcess[
 def migrated_database(tmp_path: Path) -> Path:
     path = tmp_path / "application.sqlite3"
     assert run_admin("migrate", path).returncode == 0
-    assert run_admin("fixtures", path).returncode == 0
+    with sqlite3.connect(path) as connection:
+        connection.executemany(
+            "INSERT INTO users (id, created_at_ms) VALUES (?, 0)",
+            [(str(user_id),) for user_id in USER_IDS.values()],
+        )
     return path
 
 
 def user_id(database_path: Path, username: str = "Alice") -> UUID:
-    with sqlite3.connect(database_path) as connection:
-        value = connection.execute(
-            "SELECT user_id FROM basic_auth_identities WHERE username = ?",
-            (username,),
-        ).fetchone()[0]
-    return UUID(value)
+    assert database_path.exists()
+    return USER_IDS[username]
 
 
 def storage(database_path: Path, **overrides: object) -> ProjectStorage:

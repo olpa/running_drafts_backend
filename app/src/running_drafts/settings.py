@@ -15,11 +15,6 @@ class AppEnvironment(StrEnum):
     PRODUCTION = "production"
 
 
-class AuthMode(StrEnum):
-    BASIC = "basic"
-    OIDC = "oidc"
-
-
 class DatabaseSettings(BaseSettings):
     model_config = SettingsConfigDict(
         case_sensitive=True,
@@ -37,48 +32,15 @@ class DatabaseSettings(BaseSettings):
     )
 
 
-class BasicIdentitySettings(DatabaseSettings):
-    auth_mode: AuthMode = Field(validation_alias="AUTH_MODE")
-    basic_auth_usernames: list[str] = Field(
-        default_factory=list,
-        validation_alias="BASIC_AUTH_USERNAMES",
-    )
-
-    @field_validator("basic_auth_usernames")
-    @classmethod
-    def validate_basic_usernames(cls, usernames: list[str]) -> list[str]:
-        if len(usernames) != len(set(usernames)):
-            raise ValueError("Basic usernames must be unique")
-        for username in usernames:
-            if (
-                not username
-                or ":" in username
-                or any(character.isspace() for character in username)
-                or any(ord(character) < 0x21 or ord(character) > 0x7E for character in username)
-            ):
-                raise ValueError(
-                    "Basic usernames must use printable ASCII without colons or whitespace"
-                )
-        return usernames
-
-
-class FixtureSettings(BasicIdentitySettings):
-    @model_validator(mode="after")
-    def fixture_mode_must_be_basic_and_non_production(self) -> FixtureSettings:
-        if self.app_env is AppEnvironment.PRODUCTION:
-            raise ValueError("fixtures are forbidden in production")
-        if self.auth_mode is not AuthMode.BASIC:
-            raise ValueError("fixtures require AUTH_MODE=basic")
-        if not self.basic_auth_usernames:
-            raise ValueError("fixtures require at least one Basic username")
-        return self
-
-
-class Settings(BasicIdentitySettings):
+class Settings(DatabaseSettings):
     allowed_origins: list[str] = Field(validation_alias="ALLOWED_ORIGINS")
-    basic_auth_password: SecretStr | None = Field(
+    test_control_bootstrap_credential: SecretStr | None = Field(
         default=None,
-        validation_alias="BASIC_AUTH_PASSWORD",
+        validation_alias="TEST_CONTROL_BOOTSTRAP_CREDENTIAL",
+    )
+    test_control_derivation_key: SecretStr | None = Field(
+        default=None,
+        validation_alias="TEST_CONTROL_DERIVATION_KEY",
     )
     public_editor_url: str | None = Field(default=None, validation_alias="PUBLIC_EDITOR_URL")
     google_client_id: str | None = Field(default=None, validation_alias="GOOGLE_CLIENT_ID")
@@ -125,6 +87,8 @@ class Settings(BasicIdentitySettings):
         "google_client_id",
         "google_client_secret",
         "google_redirect_uri",
+        "test_control_bootstrap_credential",
+        "test_control_derivation_key",
         mode="before",
     )
     @classmethod
@@ -144,40 +108,39 @@ class Settings(BasicIdentitySettings):
         return value.rstrip("/")
 
     @model_validator(mode="after")
-    def validate_authentication_mode(self) -> Settings:
-        if self.auth_mode is AuthMode.OIDC:
-            configured = (
-                self.google_client_id is not None,
-                self.google_client_secret is not None
-                and bool(self.google_client_secret.get_secret_value()),
-            )
-            if any(configured) and not all(configured):
-                raise ValueError("Google OIDC configuration is incomplete")
-            if self.public_editor_url is None:
-                raise ValueError("PUBLIC_EDITOR_URL is required for AUTH_MODE=oidc")
-            if self.public_editor_url not in self.allowed_origins:
-                raise ValueError("PUBLIC_EDITOR_URL must be one of ALLOWED_ORIGINS")
-            editor_url = urlsplit(self.public_editor_url)
-            if editor_url.path not in {"", "/"} or editor_url.query:
-                raise ValueError("PUBLIC_EDITOR_URL must be an origin without a path or query")
-            if self.app_env is AppEnvironment.PRODUCTION and not self.session_cookie_secure:
-                raise ValueError("SESSION_COOKIE_SECURE cannot be disabled in production")
-            if self.app_env is AppEnvironment.PRODUCTION and editor_url.scheme != "https":
-                raise ValueError("PUBLIC_EDITOR_URL must use HTTPS in production")
-            if (
-                self.app_env is AppEnvironment.PRODUCTION
-                and self.google_redirect_uri is not None
-                and urlsplit(self.google_redirect_uri).scheme != "https"
-            ):
-                raise ValueError("GOOGLE_REDIRECT_URI must use HTTPS in production")
-            return self
-        if self.app_env is AppEnvironment.PRODUCTION:
-            raise ValueError("AUTH_MODE=basic is forbidden in production")
-        if not self.basic_auth_usernames:
-            raise ValueError("at least one Basic username is required")
-        if self.basic_auth_password is None or not self.basic_auth_password.get_secret_value():
-            raise ValueError("a nonempty Basic password is required")
+    def validate_authentication(self) -> Settings:
+        configured = (
+            self.google_client_id is not None,
+            self.google_client_secret is not None
+            and bool(self.google_client_secret.get_secret_value()),
+        )
+        if any(configured) and not all(configured):
+            raise ValueError("Google OIDC configuration is incomplete")
+        if self.public_editor_url is None:
+            raise ValueError("PUBLIC_EDITOR_URL is required")
+        if self.public_editor_url not in self.allowed_origins:
+            raise ValueError("PUBLIC_EDITOR_URL must be one of ALLOWED_ORIGINS")
+        editor_url = urlsplit(self.public_editor_url)
+        if editor_url.path not in {"", "/"} or editor_url.query:
+            raise ValueError("PUBLIC_EDITOR_URL must be an origin without a path or query")
+        if self.app_env is AppEnvironment.PRODUCTION and not self.session_cookie_secure:
+            raise ValueError("SESSION_COOKIE_SECURE cannot be disabled in production")
+        if self.app_env is AppEnvironment.PRODUCTION and editor_url.scheme != "https":
+            raise ValueError("PUBLIC_EDITOR_URL must use HTTPS in production")
+        if (
+            self.app_env is AppEnvironment.PRODUCTION
+            and self.google_redirect_uri is not None
+            and urlsplit(self.google_redirect_uri).scheme != "https"
+        ):
+            raise ValueError("GOOGLE_REDIRECT_URI must use HTTPS in production")
         return self
+
+    @property
+    def test_control_enabled(self) -> bool:
+        return (
+            self.test_control_bootstrap_credential is not None
+            and self.test_control_derivation_key is not None
+        )
 
     @property
     def expose_api_documentation(self) -> bool:
