@@ -40,6 +40,7 @@ MIGRATIONS = (
     Migration(2, _execute_sql_resource("0002_projects.sql")),
     Migration(3, _execute_sql_resource("0003_oidc.sql")),
     Migration(4, _execute_sql_resource("0004_remove_basic_auth.sql")),
+    Migration(5, _execute_sql_resource("0005_plans_allowances.sql")),
 )
 MIGRATION_HEAD = MIGRATIONS[-1].version
 

@@ -20,6 +20,13 @@ def run_command(command: str, database_path: Path) -> subprocess.CompletedProces
     )
 
 
+def remove_allowance_schema(connection: sqlite3.Connection) -> None:
+    connection.execute("DROP TABLE allowance_grants")
+    connection.execute("ALTER TABLE users DROP COLUMN suspended_at_ms")
+    connection.execute("ALTER TABLE users DROP COLUMN stored_audio_bytes")
+    connection.execute("ALTER TABLE users DROP COLUMN plan")
+
+
 def test_migrate_creates_the_database_at_the_schema_head(tmp_path: Path) -> None:
     database_path = tmp_path / "application.sqlite3"
 
@@ -30,7 +37,7 @@ def test_migrate_creates_the_database_at_the_schema_head(tmp_path: Path) -> None
     assert second.returncode == 0, second.stderr
     assert json.loads(first.stdout)["event"] == "database_migrated"
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (5,)
         assert connection.execute("PRAGMA journal_mode").fetchone() == ("wal",)
         assert connection.execute("PRAGMA synchronous").fetchone() == (2,)
         assert connection.execute("PRAGMA auto_vacuum").fetchone() == (2,)
@@ -53,6 +60,7 @@ def test_migrate_creates_the_database_at_the_schema_head(tmp_path: Path) -> None
         "provider_identities",
         "application_sessions",
         "oidc_login_attempts",
+        "allowance_grants",
     } <= tables
     assert "basic_auth_identities" not in tables
     assert "documents" not in tables
@@ -73,6 +81,7 @@ def test_oidc_migration_advances_an_existing_schema_without_losing_accounts(
         connection.execute("DROP TABLE oidc_login_attempts")
         connection.execute("DROP TABLE application_sessions")
         connection.execute("DROP TABLE provider_identities")
+        remove_allowance_schema(connection)
         connection.execute(
             """
             CREATE TABLE basic_auth_identities (
@@ -87,7 +96,7 @@ def test_oidc_migration_advances_an_existing_schema_without_losing_accounts(
 
     assert result.returncode == 0, result.stderr
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (5,)
         assert connection.execute("SELECT id FROM users").fetchone() == (account_id,)
         tables = {
             row[0]
@@ -104,6 +113,7 @@ def test_basic_auth_removal_deletes_fixture_accounts_and_owned_data(tmp_path: Pa
     retained_account = "00000000-0000-4000-8000-000000000002"
     with sqlite3.connect(database_path) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
+        remove_allowance_schema(connection)
         connection.execute(
             """
             CREATE TABLE basic_auth_identities (
@@ -141,3 +151,44 @@ def test_basic_auth_removal_deletes_fixture_accounts_and_owned_data(tmp_path: Pa
             for row in connection.execute("SELECT name FROM sqlite_schema WHERE type = 'table'")
         }
     assert "basic_auth_identities" not in tables
+
+
+def test_allowance_migration_backfills_free_plan_and_committed_bytes(tmp_path: Path) -> None:
+    database_path = tmp_path / "version-four.sqlite3"
+    assert run_command("migrate", database_path).returncode == 0
+    account_id = "00000000-0000-4000-8000-000000000001"
+    with sqlite3.connect(database_path) as connection:
+        remove_allowance_schema(connection)
+        connection.execute("INSERT INTO users (id, created_at_ms) VALUES (?, 0)", (account_id,))
+        connection.execute(
+            """
+            INSERT INTO projects (
+                id, owner_id, creation_key, original_title, title,
+                created_at_ms, updated_at_ms
+            ) VALUES ('project', ?, 'key', 'Title', 'Title', 0, 0)
+            """,
+            (account_id,),
+        )
+        connection.execute(
+            """
+            INSERT INTO sections (
+                id, project_id, position, creation_key, creation_media_type
+            ) VALUES ('section', 'project', 0, 'key', 'audio/webm;codecs=opus')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO audio_assets (id, section_id, media_type, stored_bytes)
+            VALUES ('asset', 'section', 'audio/webm;codecs=opus', 7)
+            """
+        )
+        connection.execute("PRAGMA user_version = 4")
+
+    result = run_command("migrate", database_path)
+
+    assert result.returncode == 0, result.stderr
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT plan, stored_audio_bytes FROM users WHERE id = ?",
+            (account_id,),
+        ).fetchone() == ("free", 7)

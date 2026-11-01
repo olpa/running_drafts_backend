@@ -53,6 +53,17 @@ def test_compose_migrates_serves_controls_and_restarts() -> None:
         "SESSION_COOKIE_SECURE": "false",
         "TEST_CONTROL_BOOTSTRAP_CREDENTIAL": "container-bootstrap",
         "TEST_CONTROL_DERIVATION_KEY": "container-derivation",
+        "DATABASE_MIN_FREE_BYTES": "0",
+        "DOWNLOAD_STAGING_DIRECTORY": "/staging",
+        "STAGING_MIN_FREE_BYTES": "0",
+        "MAX_TRANSPORT_FRAME_BYTES": "2097152",
+        "ACCOUNT_REQUESTS_PER_MINUTE": "30000",
+        "ACCOUNT_REQUEST_BURST": "15000",
+        "PROCESS_REQUESTS_PER_MINUTE": "600000",
+        "PROCESS_REQUEST_BURST": "60000",
+        "MAX_ACCOUNT_CONCURRENT_FRAME_UPLOADS": "200",
+        "MAX_PROCESS_CONCURRENT_FRAME_UPLOADS": "1600",
+        "MAX_STAGED_DOWNLOAD_FILES": "200",
     }
 
     def compose(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -104,7 +115,7 @@ def test_compose_migrates_serves_controls_and_restarts() -> None:
         identity = compose("exec", "-T", "api", "id", "-u")
         base_url = api_base_url()
 
-        assert last_json_event(migrated.stdout)["schema_version"] == 4
+        assert last_json_event(migrated.stdout)["schema_version"] == 5
         assert identity.stdout.strip() == "1000"
         assert wait_for(f"{base_url}/health/live") == {"status": "ok"}
         assert wait_for(f"{base_url}/health/ready") == {"status": "ok"}

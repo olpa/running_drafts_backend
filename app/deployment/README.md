@@ -27,6 +27,11 @@ Omit the backup only for the first migration of a new, empty target.
 Development uses Compose project `running-drafts-backend-dev`, loopback HTTP
 port 18081, and `data-dev`. Production uses
 `running-drafts-backend-prod`, loopback HTTP port 18082, and `data-prod`.
+Both targets bind host `DOWNLOAD_STAGING_HOST_DIRECTORY=/rnotes/tmp` at the
+API-only `/staging` path. The API validates that directory at startup and uses
+the independent database and staging minimum-free-byte settings from the target
+environment. Being below a minimum rejects new ingestion or staging but does
+not make readiness fail.
 boringproxy terminates public HTTPS for `drafts-api-dev.handsfree.vc` and
 `drafts-api.handsfree.vc` and proxies plain HTTP to those listeners. Its route
 database owns certificate issuance and renewal; this deployment owns no TLS

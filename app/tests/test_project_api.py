@@ -1088,6 +1088,7 @@ def test_openapi_declares_routes_security_locations_and_problem_details(
         "/api/v1/audio-assets/{audio_asset_id}/complete",
         "/api/v1/audio-assets/{audio_asset_id}/interrupt",
         "/api/v1/audio-assets/{audio_asset_id}/download",
+        "/api/v1/me/usage",
     } <= paths.keys()
     create_operation = paths["/api/v1/projects"]["post"]
     assert create_operation["security"] == [{"ApplicationSession": []}]
@@ -1117,12 +1118,12 @@ def test_openapi_declares_routes_security_locations_and_problem_details(
         "type": "string",
         "format": "binary",
         "minLength": 1,
-        "maxLength": 2 * 1024 * 1024,
+        "description": "Bounded by MAX_TRANSPORT_FRAME_BYTES.",
     }
-    assert {"200", "401", "404", "409", "413", "415", "422", "503"} <= set(
+    assert {"200", "401", "403", "404", "409", "413", "415", "422", "429", "503"} <= set(
         frame_operation["responses"]
     )
-    for status_code in ("401", "404", "409", "413", "415", "422", "503"):
+    for status_code in ("401", "403", "404", "409", "413", "415", "422", "429", "503"):
         assert (
             "application/problem+json"
             in frame_operation["responses"][status_code]["content"]

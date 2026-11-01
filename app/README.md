@@ -12,10 +12,19 @@ from the Whisper service in `../inference`.
 `APP_ENV` must be `development`, `test`, or `production`. Protected APIs always
 use browser Application Sessions. CORS origins are a JSON array and wildcards
 are rejected.
-`MAX_TRANSPORT_FRAME_BYTES` bounds each streamed audio frame and defaults to
-2097152 bytes (2 MiB).
-`MAX_STAGED_DOWNLOAD_FILES` bounds concurrent audio downloads per application
-process and defaults to 20.
+The API has no defaults for capacity settings. The checked-in environment
+samples explicitly configure the 2 MiB transport-frame bound, Account/process
+request rates and bursts, Account/process upload concurrency, and the
+two-file staged-download limit. The `db-admin` process does not require these
+API-only settings.
+
+`DATABASE_MIN_FREE_BYTES` applies to the filesystem containing
+`DATABASE_PATH`. `STAGING_MIN_FREE_BYTES` applies independently to the
+filesystem containing the mandatory absolute `DOWNLOAD_STAGING_DIRECTORY`.
+The API performs a simple free-space preflight before accepting a new frame or
+staging a known-size download. Starting below a minimum keeps the service ready
+for reads and deletion. The staging directory must already exist and pass a
+create/inspect/remove writability probe at API startup.
 
 ## Browser authentication
 
@@ -91,7 +100,8 @@ The first command builds the current `db-admin` image before applying migrations
 this avoids reusing an image produced from older source or lockfile contents.
 
 Neither `docker compose up` nor API startup creates, migrates, or seeds the
-database. Compose stores SQLite in the named `application-data` volume. The API
+database. Compose stores SQLite in the named `application-data` volume and
+stages downloads in the separate `download-staging` volume. The API
 container remains alive when the database is unavailable or at the wrong schema
 version, but its health check remains unhealthy because `/health/ready` returns
 503.
@@ -111,6 +121,20 @@ The API listens on port 8000 by default. Development and test expose `/docs`
 and `/openapi.json`; production disables both. `/health/live` never touches the
 database. `/health/ready` opens the database without creating it, runs a query,
 checks WAL mode, and requires the exact application migration head.
+
+## Plans, allowances, and local administration
+
+Every Account starts on the source-controlled Free Plan. The API reports the
+effective Plan, aggregate active grants, usage, warning threshold, and hard
+limit through `GET /api/v1/me/usage`. A newly accepted frame and its Account
+storage counter commit in one SQLite transaction. Exact frame retries remain
+uncharged and successful at a hard boundary.
+
+The one-shot `db-admin` container exposes `account-find`, operator Allowance
+Grant create/patch/remove, Downgrade Grant patch/remove, and Account
+suspend/reinstate commands. Mutations require an explicit Account UUID and
+reason and emit a structured success event. Suspension deletes existing
+Application Sessions without deleting Account data.
 
 ## Database space maintenance
 

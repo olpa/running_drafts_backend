@@ -13,12 +13,18 @@ from pathlib import Path
 from typing import BinaryIO, Literal
 from uuid import UUID, uuid4
 
+from running_drafts.allowances import EffectiveAllowance, effective_allowance
 from running_drafts.database import (
     DatabaseBusy,
     DatabaseConfigurationError,
     DatabaseUnavailable,
     existing_connection,
     is_busy_error,
+)
+from running_drafts.filesystem_capacity import StorageReserveUnavailable, require_capacity
+from running_drafts.storage_accounting import (
+    StorageAccountingInvariant,
+    calculate_storage_accounting_invariant,
 )
 
 CANONICAL_MEDIA_TYPE = "audio/webm;codecs=opus"
@@ -83,6 +89,18 @@ class TemporaryFileFailure(RuntimeError):
 
 
 class FrameConflict(Exception):
+    pass
+
+
+class AccountSuspended(Exception):
+    pass
+
+
+class AudioStorageLimitExceeded(Exception):
+    pass
+
+
+class AudioAssetDurationLimitExceeded(Exception):
     pass
 
 
@@ -191,6 +209,10 @@ def _temporary_file() -> BinaryIO:
     return tempfile.TemporaryFile(mode="w+b")
 
 
+def _temporary_file_in(directory: Path) -> BinaryIO:
+    return tempfile.TemporaryFile(mode="w+b", dir=directory)
+
+
 def _raise_temporary_file_error(error: OSError) -> None:
     if error.errno in {errno.ENOSPC, errno.EDQUOT}:
         raise DownloadStorageUnavailable from error
@@ -225,13 +247,32 @@ class ProjectStorage:
         busy_timeout_ms: int,
         clock_ms: Callable[[], int] = _now_ms,
         new_id: Callable[[], UUID] = uuid4,
-        temporary_file_factory: Callable[[], BinaryIO] = _temporary_file,
+        temporary_file_factory: Callable[[], BinaryIO] | None = None,
+        database_min_free_bytes: int = 0,
+        download_staging_directory: Path | None = None,
+        staging_min_free_bytes: int = 0,
     ) -> None:
         self._database_path = database_path
         self._busy_timeout_ms = busy_timeout_ms
         self._clock_ms = clock_ms
         self._new_id = new_id
-        self._temporary_file_factory = temporary_file_factory
+        self._database_min_free_bytes = database_min_free_bytes
+        self._download_staging_directory = download_staging_directory
+        self._staging_min_free_bytes = staging_min_free_bytes
+        self._temporary_file_factory = temporary_file_factory or (
+            (lambda: _temporary_file_in(download_staging_directory))
+            if download_staging_directory is not None
+            else _temporary_file
+        )
+
+    @staticmethod
+    def _assert_account_active(connection: sqlite3.Connection, owner_id: UUID) -> None:
+        row = connection.execute(
+            "SELECT suspended_at_ms FROM users WHERE id = ?",
+            (str(owner_id),),
+        ).fetchone()
+        if row is not None and row[0] is not None:
+            raise AccountSuspended
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -272,6 +313,7 @@ class ProjectStorage:
     ) -> CreationResult[ProjectSummary]:
         title = normalize_title(title)
         with self._transaction() as connection:
+            self._assert_account_active(connection, owner_id)
             existing = connection.execute(
                 """
                 SELECT id, title, original_title, created_at_ms, updated_at_ms
@@ -311,6 +353,7 @@ class ProjectStorage:
 
     def list_projects(self, owner_id: UUID) -> tuple[ProjectSummary, ...]:
         with self._connection() as connection:
+            self._assert_account_active(connection, owner_id)
             rows = connection.execute(
                 """
                 SELECT id, title, created_at_ms, updated_at_ms
@@ -324,6 +367,7 @@ class ProjectStorage:
 
     def get_project(self, owner_id: UUID, project_id: UUID) -> ProjectDetail:
         with self._connection() as connection:
+            self._assert_account_active(connection, owner_id)
             project = connection.execute(
                 """
                 SELECT id, title, created_at_ms, updated_at_ms
@@ -372,6 +416,7 @@ class ProjectStorage:
     ) -> ProjectSummary:
         title = normalize_title(title)
         with self._transaction() as connection:
+            self._assert_account_active(connection, owner_id)
             existing = connection.execute(
                 """
                 SELECT id, title, created_at_ms, updated_at_ms
@@ -405,6 +450,7 @@ class ProjectStorage:
     ) -> CreationResult[SectionCreation]:
         media_type = canonicalize_media_type(media_type)
         with self._transaction() as connection:
+            self._assert_account_active(connection, owner_id)
             project = connection.execute(
                 "SELECT created_at_ms FROM projects WHERE id = ? AND owner_id = ?",
                 (str(project_id), str(owner_id)),
@@ -516,16 +562,20 @@ class ProjectStorage:
                     audio_assets.next_expected_sequence,
                     audio_assets.observed_duration_ms,
                     projects.id AS project_id,
-                    projects.created_at_ms
+                    projects.created_at_ms,
+                    users.suspended_at_ms
                 FROM audio_assets
                 JOIN sections ON sections.id = audio_assets.section_id
                 JOIN projects ON projects.id = sections.project_id
+                JOIN users ON users.id = projects.owner_id
                 WHERE audio_assets.id = ? AND projects.owner_id = ?
                 """,
                 (str(audio_asset_id), str(owner_id)),
             ).fetchone()
             if row is None:
                 raise ResourceNotFound
+            if row["suspended_at_ms"] is not None:
+                raise AccountSuspended
             next_expected_sequence = row["next_expected_sequence"]
             if sequence < next_expected_sequence:
                 stored = connection.execute(
@@ -553,6 +603,20 @@ class ProjectStorage:
                 raise FrameConflict
             if start_ms != row["observed_duration_ms"]:
                 raise FrameConflict
+
+            try:
+                require_capacity(
+                    self._database_path.parent,
+                    candidate_bytes=len(payload),
+                    minimum_free_bytes=self._database_min_free_bytes,
+                )
+            except StorageReserveUnavailable:
+                raise DownloadStorageUnavailable from None
+            allowance = effective_allowance(connection, str(owner_id))
+            if allowance.used_storage_bytes + len(payload) > allowance.storage_limit_bytes:
+                raise AudioStorageLimitExceeded
+            if end_ms > allowance.duration_limit_ms:
+                raise AudioAssetDurationLimitExceeded
 
             connection.execute(
                 """
@@ -582,6 +646,10 @@ class ProjectStorage:
                 """,
                 (next_expected_sequence, end_ms, len(payload), str(audio_asset_id)),
             )
+            connection.execute(
+                "UPDATE users SET stored_audio_bytes = stored_audio_bytes + ? WHERE id = ?",
+                (len(payload), str(owner_id)),
+            )
             updated_at_ms = max(self._clock_ms(), row["created_at_ms"])
             connection.execute(
                 "UPDATE projects SET updated_at_ms = ? WHERE id = ?",
@@ -602,6 +670,7 @@ class ProjectStorage:
         frame_count: int | None,
     ) -> AudioAssetSummary:
         with self._transaction() as connection:
+            self._assert_account_active(connection, owner_id)
             row = connection.execute(
                 """
                 SELECT
@@ -675,12 +744,28 @@ class ProjectStorage:
                 (str(owner_id),),
             ).fetchone()[0]
 
+    def account_usage(self, owner_id: UUID) -> EffectiveAllowance:
+        with self._connection() as connection:
+            self._assert_account_active(connection, owner_id)
+            try:
+                return effective_allowance(connection, str(owner_id))
+            except LookupError as error:
+                raise ResourceNotFound from error
+
+    def storage_accounting_invariant(self, owner_id: UUID) -> StorageAccountingInvariant:
+        with self._connection() as connection:
+            try:
+                return calculate_storage_accounting_invariant(connection, owner_id)
+            except LookupError as error:
+                raise ResourceNotFound from error
+
     def stage_audio_download(
         self,
         owner_id: UUID,
         audio_asset_id: UUID,
     ) -> StagedAudioDownload:
         with self._connection() as connection:
+            self._assert_account_active(connection, owner_id)
             connection.execute("BEGIN")
             asset = connection.execute(
                 """
@@ -702,6 +787,20 @@ class ProjectStorage:
                 raise ResourceNotFound
             if not asset["is_sealed"]:
                 raise AudioAssetNotSealed
+
+            candidate_bytes = asset["stored_bytes"]
+            if asset["next_expected_sequence"] == 0:
+                empty_asset = files("running_drafts").joinpath("assets/empty-audio.webm")
+                candidate_bytes = empty_asset.stat().st_size
+            if self._download_staging_directory is not None:
+                try:
+                    require_capacity(
+                        self._download_staging_directory,
+                        candidate_bytes=candidate_bytes,
+                        minimum_free_bytes=self._staging_min_free_bytes,
+                    )
+                except StorageReserveUnavailable:
+                    raise DownloadStorageUnavailable from None
 
             if asset["next_expected_sequence"] == 0:
                 if asset["stored_bytes"] != 0:

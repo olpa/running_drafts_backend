@@ -78,8 +78,9 @@ def test_security_sensitive_settings_are_strict(tmp_path: Path) -> None:
         )
 
 
-def test_staged_download_limit_defaults_to_twenty_and_must_be_positive(
+def test_api_capacity_settings_are_mandatory_and_zero_is_literal(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     common = {
         "app_env": AppEnvironment.TEST,
@@ -88,9 +89,11 @@ def test_staged_download_limit_defaults_to_twenty_and_must_be_positive(
         "public_editor_url": "https://editor.test",
     }
 
-    assert Settings(**common).max_staged_download_files == 20
+    monkeypatch.delenv("MAX_STAGED_DOWNLOAD_FILES")
     with pytest.raises(ValidationError):
-        Settings(**common, max_staged_download_files=0)
+        Settings(**common)
+    settings = Settings(**common, max_staged_download_files=0)
+    assert settings.max_staged_download_files == 0
 
 
 def test_oidc_starts_without_a_configured_provider(tmp_path: Path) -> None:
