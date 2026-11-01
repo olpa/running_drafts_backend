@@ -27,7 +27,8 @@ from running_drafts.project_storage import (
     canonicalize_media_type,
     normalize_title,
 )
-from running_drafts.settings import DEFAULT_MAX_TRANSPORT_FRAME_BYTES, Settings
+from running_drafts.request_limits import RequestLimiter, UploadCapacity
+from running_drafts.settings import Settings
 
 MAX_SQLITE_INTEGER = 2**63 - 1
 
@@ -171,6 +172,25 @@ class FrameAcknowledgementResponse(CamelCaseResponse):
     acknowledged: Literal[True] = True
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     next_expected_sequence: int = Field(ge=0)
+
+
+class AudioStorageUsageResponse(CamelCaseResponse):
+    used_bytes: int
+    granted_bytes: int
+    warning_at_bytes: int
+    limit_bytes: int
+
+
+class AudioAssetDurationUsageResponse(CamelCaseResponse):
+    granted_ms: int
+    warning_at_ms: int
+    limit_ms: int
+
+
+class UsageResponse(CamelCaseResponse):
+    plan: str
+    audio_storage: AudioStorageUsageResponse
+    audio_asset_duration: AudioAssetDurationUsageResponse
 
 
 def _datetime(timestamp_ms: int | None) -> datetime | None:
@@ -331,11 +351,19 @@ def project_storage(request: Request) -> ProjectStorage:
     return ProjectStorage(
         settings.database_path,
         busy_timeout_ms=settings.database_busy_timeout_ms,
+        database_min_free_bytes=settings.database_min_free_bytes,
+        download_staging_directory=settings.download_staging_directory,
+        staging_min_free_bytes=settings.staging_min_free_bytes,
     )
 
 
 AuthenticatedUser = Annotated[UUID, Depends(authenticated_user_id)]
 Storage = Annotated[ProjectStorage, Depends(project_storage)]
+
+
+def enforce_request_limit(request: Request, user_id: AuthenticatedUser) -> None:
+    limiter: RequestLimiter = request.app.state.request_limiter
+    limiter.consume(user_id)
 
 
 def _problem_response(
@@ -366,7 +394,9 @@ COMMON_RESPONSES = {
             }
         },
     ),
+    403: _problem_response("Account suspended or request origin rejected"),
     422: _problem_response("Request validation failed"),
+    429: _problem_response("Request or allowance limit exceeded"),
     503: _problem_response("Database unavailable"),
 }
 NOT_FOUND_RESPONSES = COMMON_RESPONSES | {
@@ -411,7 +441,30 @@ CREATED_RESPONSE = {
     }
 }
 
-router = APIRouter(prefix="/api/v1", tags=["projects"])
+router = APIRouter(
+    prefix="/api/v1",
+    tags=["projects"],
+    dependencies=[Depends(enforce_request_limit)],
+)
+
+
+@router.get("/me/usage", response_model=UsageResponse, responses=COMMON_RESPONSES)
+def get_usage(user_id: AuthenticatedUser, storage: Storage) -> UsageResponse:
+    usage = storage.account_usage(user_id)
+    return UsageResponse(
+        plan=usage.plan.value,
+        audio_storage=AudioStorageUsageResponse(
+            used_bytes=usage.used_storage_bytes,
+            granted_bytes=usage.granted_storage_bytes,
+            warning_at_bytes=usage.storage_warning_bytes,
+            limit_bytes=usage.storage_limit_bytes,
+        ),
+        audio_asset_duration=AudioAssetDurationUsageResponse(
+            granted_ms=usage.granted_duration_ms,
+            warning_at_ms=usage.duration_warning_ms,
+            limit_ms=usage.duration_limit_ms,
+        ),
+    )
 
 
 @router.post(
@@ -505,7 +558,7 @@ def create_section(
                         "type": "string",
                         "format": "binary",
                         "minLength": 1,
-                        "maxLength": DEFAULT_MAX_TRANSPORT_FRAME_BYTES,
+                        "description": "Bounded by MAX_TRANSPORT_FRAME_BYTES.",
                     }
                 }
             },
@@ -527,44 +580,49 @@ async def upload_audio_frame(
     user_id: AuthenticatedUser,
     storage: Storage,
 ) -> FrameAcknowledgementResponse:
-    if end_ms <= start_ms:
-        raise _frame_problem(
-            422,
-            "Request validation failed",
-            "X-Frame-End-Ms must be greater than X-Frame-Start-Ms.",
-            "request_validation_error",
-        )
-    content_type = request.headers.get("content-type")
-    if content_type is None:
-        raise _frame_problem(
-            415,
-            "Unsupported media type",
-            "Content-Type must identify WebM audio with the Opus codec.",
-            "unsupported_media_type",
-        )
+    capacity: UploadCapacity = request.app.state.upload_capacity
+    lease = capacity.acquire(user_id)
     try:
-        media_type = canonicalize_media_type(content_type)
-    except UnsupportedMediaType as error:
-        raise _frame_problem(
-            415,
-            "Unsupported media type",
-            str(error),
-            "unsupported_media_type",
-        ) from None
-    settings: Settings = request.app.state.settings
-    payload = await _read_frame_body(request, settings.max_transport_frame_bytes)
-    return _frame_acknowledgement_response(
-        await run_in_threadpool(
-            storage.accept_audio_frame,
-            user_id,
-            audio_asset_id,
-            sequence=sequence,
-            start_ms=start_ms,
-            end_ms=end_ms,
-            media_type=media_type,
-            payload=payload,
+        if end_ms <= start_ms:
+            raise _frame_problem(
+                422,
+                "Request validation failed",
+                "X-Frame-End-Ms must be greater than X-Frame-Start-Ms.",
+                "request_validation_error",
+            )
+        content_type = request.headers.get("content-type")
+        if content_type is None:
+            raise _frame_problem(
+                415,
+                "Unsupported media type",
+                "Content-Type must identify WebM audio with the Opus codec.",
+                "unsupported_media_type",
+            )
+        try:
+            media_type = canonicalize_media_type(content_type)
+        except UnsupportedMediaType as error:
+            raise _frame_problem(
+                415,
+                "Unsupported media type",
+                str(error),
+                "unsupported_media_type",
+            ) from None
+        settings: Settings = request.app.state.settings
+        payload = await _read_frame_body(request, settings.max_transport_frame_bytes)
+        return _frame_acknowledgement_response(
+            await run_in_threadpool(
+                storage.accept_audio_frame,
+                user_id,
+                audio_asset_id,
+                sequence=sequence,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                media_type=media_type,
+                payload=payload,
+            )
         )
-    )
+    finally:
+        lease.release()
 
 
 @router.post(

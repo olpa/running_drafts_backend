@@ -4,6 +4,7 @@ from uuid import UUID, uuid4
 from running_drafts import clock
 from running_drafts.database import existing_connection
 from running_drafts.oauth import ProviderClaims
+from running_drafts.project_storage import AccountSuspended
 from running_drafts.settings import Settings
 
 
@@ -67,6 +68,12 @@ def resolve_or_provision_identity(
                 )
             else:
                 account_id = UUID(row[0])
+                suspended = connection.execute(
+                    "SELECT suspended_at_ms FROM users WHERE id = ?",
+                    (str(account_id),),
+                ).fetchone()
+                if suspended is not None and suspended[0] is not None:
+                    raise AccountSuspended
                 connection.execute(
                     """
                     UPDATE provider_identities

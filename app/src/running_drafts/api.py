@@ -19,6 +19,11 @@ from running_drafts.database import (
     DatabaseUnavailable,
     existing_connection,
 )
+from running_drafts.filesystem_capacity import (
+    StorageReserveUnavailable,
+    available_bytes,
+    validate_writable_directory,
+)
 from running_drafts.migrations import MIGRATION_HEAD
 from running_drafts.oauth import ProviderRegistry, create_provider_registry
 from running_drafts.problems import ProblemException, problem_response
@@ -28,13 +33,22 @@ from running_drafts.project_api import (
 )
 from running_drafts.project_api import router as project_router
 from running_drafts.project_storage import (
+    AccountSuspended,
     AudioAssemblyFailure,
+    AudioAssetDurationLimitExceeded,
     AudioAssetNotSealed,
     AudioAssetSealConflict,
+    AudioStorageLimitExceeded,
     DownloadStorageUnavailable,
     FrameConflict,
     IdempotencyKeyReused,
     ResourceNotFound,
+)
+from running_drafts.request_limits import (
+    RequestLimiter,
+    RequestRateLimitExceeded,
+    UploadCapacity,
+    UploadConcurrencyLimitExceeded,
 )
 from running_drafts.settings import AppEnvironment, Settings
 from running_drafts.test_control import CONTROL_PREFIX, create_test_control_router
@@ -96,6 +110,24 @@ def create_app(
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        validate_writable_directory(settings.download_staging_directory)
+        for name, path, minimum in (
+            ("database", settings.database_path.parent, settings.database_min_free_bytes),
+            ("staging", settings.download_staging_directory, settings.staging_min_free_bytes),
+        ):
+            try:
+                available = available_bytes(path)
+            except StorageReserveUnavailable:
+                logger.warning("storage capacity unavailable target=%s", name)
+            else:
+                if available < minimum:
+                    logger.warning(
+                        "storage below configured reserve target=%s availableBytes=%s "
+                        "minimumFreeBytes=%s",
+                        name,
+                        available,
+                        minimum,
+                    )
         yield
 
     documentation_url = "/docs" if settings.expose_api_documentation else None
@@ -108,6 +140,16 @@ def create_app(
     app.state.settings = settings
     app.state.provider_registry = provider_registry or create_provider_registry(settings)
     app.state.download_capacity = DownloadCapacity(settings.max_staged_download_files)
+    app.state.request_limiter = RequestLimiter(
+        account_requests_per_minute=settings.account_requests_per_minute,
+        account_burst=settings.account_request_burst,
+        process_requests_per_minute=settings.process_requests_per_minute,
+        process_burst=settings.process_request_burst,
+    )
+    app.state.upload_capacity = UploadCapacity(
+        per_account=settings.max_account_concurrent_frame_uploads,
+        process=settings.max_process_concurrent_frame_uploads,
+    )
     if settings.test_control_enabled:
         app.include_router(create_test_control_router(settings))
         logger.info("test control enabled")
@@ -217,6 +259,68 @@ def create_app(
             code="frame_conflict",
         )
 
+    @app.exception_handler(AudioStorageLimitExceeded)
+    def handle_audio_storage_limit(
+        _request: Request,
+        _error: AudioStorageLimitExceeded,
+    ) -> JSONResponse:
+        return problem_response(
+            status=429,
+            title="Audio storage limit exceeded",
+            detail="The Account audio storage allowance has been reached.",
+            code="audio_storage_limit_exceeded",
+        )
+
+    @app.exception_handler(AudioAssetDurationLimitExceeded)
+    def handle_audio_duration_limit(
+        _request: Request,
+        _error: AudioAssetDurationLimitExceeded,
+    ) -> JSONResponse:
+        return problem_response(
+            status=429,
+            title="Audio asset duration limit exceeded",
+            detail="The Audio Asset duration allowance has been reached.",
+            code="audio_asset_duration_limit_exceeded",
+        )
+
+    @app.exception_handler(AccountSuspended)
+    def handle_account_suspended(
+        _request: Request,
+        _error: AccountSuspended,
+    ) -> JSONResponse:
+        return problem_response(
+            status=403,
+            title="Account suspended",
+            detail="This Account is unavailable. Contact support for help.",
+            code="account_suspended",
+        )
+
+    @app.exception_handler(RequestRateLimitExceeded)
+    def handle_request_rate_limit(
+        _request: Request,
+        error: RequestRateLimitExceeded,
+    ) -> JSONResponse:
+        logger.warning("request rate limit exceeded scope=%s", error.args[0])
+        return problem_response(
+            status=429,
+            title="Request rate limit exceeded",
+            detail="Too many requests were made.",
+            code="request_rate_limit_exceeded",
+        )
+
+    @app.exception_handler(UploadConcurrencyLimitExceeded)
+    def handle_upload_concurrency_limit(
+        _request: Request,
+        error: UploadConcurrencyLimitExceeded,
+    ) -> JSONResponse:
+        logger.warning("upload concurrency limit exceeded scope=%s", error.args[0])
+        return problem_response(
+            status=429,
+            title="Upload concurrency limit exceeded",
+            detail="Too many frame uploads are already active.",
+            code="upload_concurrency_limit_exceeded",
+        )
+
     @app.exception_handler(DatabaseBusy)
     def handle_database_busy(_request: Request, _error: DatabaseBusy) -> JSONResponse:
         return problem_response(
@@ -246,7 +350,7 @@ def create_app(
         return problem_response(
             status=503,
             title="Storage unavailable",
-            detail="Temporary storage is unavailable.",
+            detail="Storage is unavailable.",
             code="storage_unavailable",
         )
 

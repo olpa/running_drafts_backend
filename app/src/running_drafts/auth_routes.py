@@ -31,6 +31,8 @@ from running_drafts.oauth_transactions import (
     delete_login_attempt,
 )
 from running_drafts.problems import ProblemException, problem_response
+from running_drafts.project_api import COMMON_RESPONSES, enforce_request_limit
+from running_drafts.project_storage import AccountSuspended
 from running_drafts.session_cookie import clear_session_cookie, set_session_cookie
 from running_drafts.settings import Settings
 
@@ -318,6 +320,13 @@ async def oidc_callback(provider: str, request: Request) -> Response:
     else:
         try:
             identity = resolve_or_provision_identity(settings, claims)
+        except AccountSuspended:
+            response = problem_response(
+                status=403,
+                title="Account suspended",
+                detail="This Account is unavailable. Contact support for help.",
+                code="account_suspended",
+            )
         except Exception:
             reference_id = str(uuid4())
             _log_unexpected_authentication_failure(
@@ -366,7 +375,12 @@ def logout(request: Request) -> Response:
     return response
 
 
-@router.get("/api/v1/me", response_model=CurrentSessionResponse)
+@router.get(
+    "/api/v1/me",
+    response_model=CurrentSessionResponse,
+    dependencies=[Depends(enforce_request_limit)],
+    responses=COMMON_RESPONSES,
+)
 def current_session(
     request: Request,
     account_id: Annotated[UUID, Depends(authenticated_user_id)],

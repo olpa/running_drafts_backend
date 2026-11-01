@@ -5,9 +5,6 @@ from urllib.parse import urlsplit
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-DEFAULT_MAX_TRANSPORT_FRAME_BYTES = 2 * 1024 * 1024
-DEFAULT_MAX_STAGED_DOWNLOAD_FILES = 20
-
 
 class AppEnvironment(StrEnum):
     DEVELOPMENT = "development"
@@ -52,15 +49,28 @@ class Settings(DatabaseSettings):
     session_cookie_secure: bool = Field(default=True, validation_alias="SESSION_COOKIE_SECURE")
     server_host: str = Field(default="0.0.0.0", validation_alias="SERVER_HOST")
     server_port: int = Field(default=8000, ge=1, le=65_535, validation_alias="SERVER_PORT")
+    database_min_free_bytes: int = Field(ge=0, validation_alias="DATABASE_MIN_FREE_BYTES")
+    download_staging_directory: Path = Field(validation_alias="DOWNLOAD_STAGING_DIRECTORY")
+    staging_min_free_bytes: int = Field(ge=0, validation_alias="STAGING_MIN_FREE_BYTES")
     max_transport_frame_bytes: int = Field(
-        default=DEFAULT_MAX_TRANSPORT_FRAME_BYTES,
-        gt=0,
+        ge=0,
         validation_alias="MAX_TRANSPORT_FRAME_BYTES",
     )
     max_staged_download_files: int = Field(
-        default=DEFAULT_MAX_STAGED_DOWNLOAD_FILES,
-        gt=0,
+        ge=0,
         validation_alias="MAX_STAGED_DOWNLOAD_FILES",
+    )
+    account_requests_per_minute: int = Field(ge=0, validation_alias="ACCOUNT_REQUESTS_PER_MINUTE")
+    account_request_burst: int = Field(ge=0, validation_alias="ACCOUNT_REQUEST_BURST")
+    process_requests_per_minute: int = Field(ge=0, validation_alias="PROCESS_REQUESTS_PER_MINUTE")
+    process_request_burst: int = Field(ge=0, validation_alias="PROCESS_REQUEST_BURST")
+    max_account_concurrent_frame_uploads: int = Field(
+        ge=0,
+        validation_alias="MAX_ACCOUNT_CONCURRENT_FRAME_UPLOADS",
+    )
+    max_process_concurrent_frame_uploads: int = Field(
+        ge=0,
+        validation_alias="MAX_PROCESS_CONCURRENT_FRAME_UPLOADS",
     )
 
     @field_validator("allowed_origins")
@@ -106,6 +116,13 @@ class Settings(DatabaseSettings):
         if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.fragment:
             raise ValueError("must be an absolute HTTP(S) URL without a fragment")
         return value.rstrip("/")
+
+    @field_validator("download_staging_directory")
+    @classmethod
+    def validate_staging_path(cls, value: Path) -> Path:
+        if not value.is_absolute():
+            raise ValueError("DOWNLOAD_STAGING_DIRECTORY must be an absolute path")
+        return value
 
     @model_validator(mode="after")
     def validate_authentication(self) -> Settings:
