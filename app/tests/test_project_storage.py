@@ -23,6 +23,23 @@ USER_IDS = {
     "Alice": UUID("00000000-0000-4000-8000-000000000001"),
     "Bob": UUID("00000000-0000-4000-8000-000000000002"),
 }
+MEDIARECORDER_FIXTURES = Path(__file__).parent / "fixtures" / "mediarecorder"
+FRAME_ZERO = (MEDIARECORDER_FIXTURES / "chromium-completed" / "frame-000.webm").read_bytes()
+FRAME_ONE = (MEDIARECORDER_FIXTURES / "chromium-completed" / "frame-001.webm").read_bytes()
+FIREFOX_FRAME_ZERO = (
+    MEDIARECORDER_FIXTURES / "firefox-completed" / "frame-000.webm"
+).read_bytes()
+
+
+def split_browser_stream(count: int) -> list[bytes]:
+    joined = (MEDIARECORDER_FIXTURES / "chromium-completed" / "joined.webm").read_bytes()
+    first_end = len(FRAME_ZERO)
+    remaining = joined[first_end:]
+    chunk_size = (len(remaining) + count - 2) // (count - 1)
+    return [joined[:first_end]] + [
+        remaining[offset : offset + chunk_size]
+        for offset in range(0, len(remaining), chunk_size)
+    ]
 
 
 def run_admin(command: str, database_path: Path) -> subprocess.CompletedProcess[str]:
@@ -157,20 +174,18 @@ def test_first_audio_frame_is_acknowledged_and_survives_restart(tmp_path: Path) 
         start_ms=0,
         end_ms=1_000,
         media_type="audio/webm;codecs=opus",
-        payload=b"frame-one",
+        payload=FRAME_ZERO,
     )
 
     assert acknowledgement.sequence == 0
-    assert acknowledgement.sha256 == (
-        "70a09fbff3df33ed9f6db65155e3a6e166de73e2ceab15d42103d688fc904eaa"
-    )
+    assert acknowledgement.sha256 == hashlib.sha256(FRAME_ZERO).hexdigest()
     assert acknowledgement.next_expected_sequence == 1
     restarted_store = storage(database_path)
     restarted_detail = restarted_store.get_project(owner_id, project.id)
     assert restarted_detail.project.updated_at_ms == 3_000
     assert restarted_detail.sections[0].audio_asset.frame_count == 1
     assert restarted_detail.sections[0].audio_asset.observed_duration_ms == 1_000
-    assert restarted_detail.sections[0].audio_asset.stored_bytes == 9
+    assert restarted_detail.sections[0].audio_asset.stored_bytes == len(FRAME_ZERO)
     replay = restarted_store.accept_audio_frame(
         owner_id,
         asset_id,
@@ -178,7 +193,7 @@ def test_first_audio_frame_is_acknowledged_and_survives_restart(tmp_path: Path) 
         start_ms=0,
         end_ms=1_000,
         media_type="audio/webm;codecs=opus",
-        payload=b"frame-one",
+        payload=FRAME_ZERO,
     )
     assert replay.next_expected_sequence == 1
 
@@ -203,7 +218,7 @@ def test_audio_frame_replays_are_idempotent_and_return_the_current_cursor(
         start_ms=0,
         end_ms=1_000,
         media_type="audio/webm;codecs=opus",
-        payload=b"frame-one",
+        payload=FRAME_ZERO,
     )
     second = store.accept_audio_frame(
         owner_id,
@@ -212,7 +227,7 @@ def test_audio_frame_replays_are_idempotent_and_return_the_current_cursor(
         start_ms=1_000,
         end_ms=2_000,
         media_type="audio/webm;codecs=opus",
-        payload=b"frame-two",
+        payload=FRAME_ONE,
     )
     updated_at_ms = store.get_project(owner_id, project.id).project.updated_at_ms
 
@@ -223,7 +238,7 @@ def test_audio_frame_replays_are_idempotent_and_return_the_current_cursor(
         start_ms=0,
         end_ms=1_000,
         media_type=' AUDIO/WEBM ; Codecs = "OPUS" ',
-        payload=b"frame-one",
+        payload=FRAME_ZERO,
     )
 
     assert first.next_expected_sequence == 1
@@ -235,7 +250,7 @@ def test_audio_frame_replays_are_idempotent_and_return_the_current_cursor(
     conflicting_requests = [
         {"sequence": 3, "start_ms": 2_000, "end_ms": 3_000, "payload": b"gap"},
         {"sequence": 0, "start_ms": 0, "end_ms": 1_000, "payload": b"changed"},
-        {"sequence": 0, "start_ms": 0, "end_ms": 999, "payload": b"frame-one"},
+        {"sequence": 0, "start_ms": 0, "end_ms": 999, "payload": FRAME_ZERO},
     ]
     for request in conflicting_requests:
         with pytest.raises(FrameConflict):
@@ -254,7 +269,7 @@ def test_audio_frame_replays_are_idempotent_and_return_the_current_cursor(
         start_ms=0,
         end_ms=1_000,
         media_type="audio/webm;codecs=opus",
-        payload=b"frame-one",
+        payload=FRAME_ZERO,
     )
     assert sealed_replay.next_expected_sequence == 2
     with pytest.raises(FrameConflict):
@@ -267,6 +282,62 @@ def test_audio_frame_replays_are_idempotent_and_return_the_current_cursor(
             media_type="audio/webm;codecs=opus",
             payload=b"new-after-seal",
         )
+
+
+def test_virtual_playback_matches_canonical_fixture_and_preserves_history(
+    tmp_path: Path,
+) -> None:
+    database_path = migrated_database(tmp_path)
+    owner_id = user_id(database_path)
+    store = storage(database_path)
+    project = store.create_project(owner_id, uuid4(), "Playback").value
+    asset_id = store.create_section(
+        owner_id,
+        project.id,
+        uuid4(),
+        "audio/webm;codecs=opus",
+    ).value.audio_asset_id
+    frames = [
+        (MEDIARECORDER_FIXTURES / "chromium-completed" / f"frame-{index:03}.webm").read_bytes()
+        for index in range(3)
+    ]
+    first_snapshot_bytes = None
+    for sequence, payload in enumerate(frames):
+        store.accept_audio_frame(
+            owner_id,
+            asset_id,
+            sequence=sequence,
+            start_ms=sequence * 1_000,
+            end_ms=(sequence + 1) * 1_000,
+            media_type="audio/webm;codecs=opus",
+            payload=payload,
+        )
+        if sequence == 0:
+            first = store.playback_snapshot(owner_id, asset_id, 1)
+            first_snapshot_bytes = b"".join(
+                store.playback_range(first, 0, first.total_length)
+            )
+
+    final = store.playback_snapshot(owner_id, asset_id, 3)
+    final_bytes = b"".join(store.playback_range(final, 0, final.total_length))
+    source_pcm = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", "pipe:0", "-f", "s16le", "pipe:1"],
+        input=b"".join(frames),
+        capture_output=True,
+        check=True,
+    ).stdout
+    playback_pcm = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", "pipe:0", "-f", "s16le", "pipe:1"],
+        input=final_bytes,
+        capture_output=True,
+        check=True,
+    ).stdout
+    assert playback_pcm == source_pcm
+
+    first_again = store.playback_snapshot(owner_id, asset_id, 1)
+    assert first_snapshot_bytes == b"".join(
+        store.playback_range(first_again, 0, first_again.total_length)
+    )
 
 
 def test_concurrent_section_creation_assigns_a_stable_total_order(tmp_path: Path) -> None:
@@ -379,7 +450,7 @@ def test_frame_and_seal_transactions_follow_database_order(tmp_path: Path) -> No
             start_ms=0,
             end_ms=1_000,
             media_type="audio/webm;codecs=opus",
-            payload=b"frame",
+            payload=FRAME_ZERO,
         )
         assert frame_ready.wait(timeout=5)
         sealing_after_frame = executor.submit(
@@ -393,7 +464,7 @@ def test_frame_and_seal_transactions_follow_database_order(tmp_path: Path) -> No
         completed = sealing_after_frame.result()
     assert completed.frame_count == 1
     assert completed.observed_duration_ms == 1_000
-    assert completed.stored_bytes == 5
+    assert completed.stored_bytes == len(FRAME_ZERO)
 
     seal_first = store.create_section(
         owner_id,
@@ -425,7 +496,7 @@ def test_frame_and_seal_transactions_follow_database_order(tmp_path: Path) -> No
             start_ms=0,
             end_ms=1_000,
             media_type="audio/webm;codecs=opus",
-            payload=b"frame",
+            payload=FRAME_ZERO,
         )
         release_seal.set()
         assert sealing.result().seal_reason == "interrupted"
@@ -457,12 +528,12 @@ def test_overlapping_frame_writers_store_and_charge_once(tmp_path: Path) -> None
         )
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        identical = list(executor.map(upload, [b"same-frame", b"same-frame"]))
+        identical = list(executor.map(upload, [FRAME_ZERO, FRAME_ZERO]))
 
     assert [item.next_expected_sequence for item in identical] == [1, 1]
     detail = store.get_project(owner_id, project.id)
     assert detail.sections[0].audio_asset.frame_count == 1
-    assert detail.sections[0].audio_asset.stored_bytes == 10
+    assert detail.sections[0].audio_asset.stored_bytes == len(FRAME_ZERO)
 
     competing_asset_id = store.create_section(
         owner_id,
@@ -487,12 +558,12 @@ def test_overlapping_frame_writers_store_and_charge_once(tmp_path: Path) -> None
         return "accepted"
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        outcomes = list(executor.map(compete, [b"first", b"second"]))
+        outcomes = list(executor.map(compete, [FRAME_ZERO, FIREFOX_FRAME_ZERO]))
 
     assert sorted(outcomes) == ["accepted", "conflict"]
     competing = store.get_project(owner_id, project.id).sections[1].audio_asset
     assert competing.frame_count == 1
-    assert competing.stored_bytes in {5, 6}
+    assert competing.stored_bytes in {len(FRAME_ZERO), len(FIREFOX_FRAME_ZERO)}
 
 
 def test_usage_is_derived_from_owned_audio_assets(tmp_path: Path) -> None:
@@ -585,7 +656,7 @@ def test_project_database_cascade_removes_stored_frames(tmp_path: Path) -> None:
         start_ms=0,
         end_ms=1_000,
         media_type="audio/webm;codecs=opus",
-        payload=b"frame",
+        payload=FRAME_ZERO,
     )
 
     with existing_connection(database_path, busy_timeout_ms=5_000) as connection:
@@ -618,7 +689,7 @@ def test_audio_download_rejects_inconsistent_stored_byte_accounting(tmp_path: Pa
         start_ms=0,
         end_ms=1_000,
         media_type="audio/webm;codecs=opus",
-        payload=b"frame",
+        payload=FRAME_ZERO,
     )
     store.complete_audio_asset(owner_id, asset_id, 1)
     with sqlite3.connect(database_path) as connection:
@@ -649,7 +720,7 @@ def test_audio_download_rejects_a_short_temporary_file_write(tmp_path: Path) -> 
         start_ms=0,
         end_ms=1_000,
         media_type="audio/webm;codecs=opus",
-        payload=b"frame",
+        payload=FRAME_ZERO,
     )
     base.complete_audio_asset(owner_id, asset_id, 1)
 
@@ -689,7 +760,7 @@ def test_audio_assembly_failure_reports_hashes_near_the_sequence_gap(
         uuid4(),
         "audio/webm;codecs=opus",
     ).value.audio_asset_id
-    payloads = [f"frame-{sequence}".encode() for sequence in range(5)]
+    payloads = split_browser_stream(5)
     for sequence, payload in enumerate(payloads):
         store.accept_audio_frame(
             owner_id,
@@ -735,7 +806,7 @@ def test_audio_download_and_deletion_follow_snapshot_order(tmp_path: Path) -> No
         start_ms=0,
         end_ms=1_000,
         media_type="audio/webm;codecs=opus",
-        payload=b"retained snapshot",
+        payload=FRAME_ZERO,
     )
     base.complete_audio_asset(owner_id, asset_id, 1)
     snapshot_established = Event()
@@ -758,7 +829,7 @@ def test_audio_download_and_deletion_follow_snapshot_order(tmp_path: Path) -> No
         staged = staging.result(timeout=5)
 
     try:
-        assert staged.stream.read() == b"retained snapshot"
+        assert staged.stream.read() == FRAME_ZERO
     finally:
         staged.stream.close()
     with pytest.raises(ResourceNotFound):

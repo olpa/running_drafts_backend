@@ -39,12 +39,18 @@ from running_drafts.project_storage import (
     AudioAssetNotSealed,
     AudioAssetSealConflict,
     AudioStorageLimitExceeded,
+    AudioTrackMismatch,
     DownloadStorageUnavailable,
     FrameConflict,
     IdempotencyKeyReused,
+    InvalidAudioFrame,
+    PlaybackRepresentationCorrupt,
+    PlaybackSnapshotNotAvailable,
     ResourceNotFound,
 )
 from running_drafts.request_limits import (
+    PlaybackCapacity,
+    PlaybackConcurrencyLimitExceeded,
     RequestLimiter,
     RequestRateLimitExceeded,
     UploadCapacity,
@@ -150,6 +156,10 @@ def create_app(
         per_account=settings.max_account_concurrent_frame_uploads,
         process=settings.max_process_concurrent_frame_uploads,
     )
+    app.state.playback_capacity = PlaybackCapacity(
+        per_account=settings.max_account_concurrent_playback_responses,
+        process=settings.max_process_concurrent_playback_responses,
+    )
     if settings.test_control_enabled:
         app.include_router(create_test_control_router(settings))
         logger.info("test control enabled")
@@ -166,7 +176,13 @@ def create_app(
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
-        expose_headers=["Content-Disposition"],
+        expose_headers=[
+            "Accept-Ranges",
+            "Content-Disposition",
+            "Content-Length",
+            "Content-Range",
+            "ETag",
+        ],
     )
     app.add_middleware(CookieOriginMiddleware, allowed_origins=settings.allowed_origins)
 
@@ -212,6 +228,60 @@ def create_app(
             title="Audio asset seal conflict",
             detail="The audio asset cannot be sealed with this command.",
             code="audio_asset_seal_conflict",
+        )
+
+    @app.exception_handler(InvalidAudioFrame)
+    def handle_invalid_audio_frame(
+        _request: Request,
+        _error: InvalidAudioFrame,
+    ) -> JSONResponse:
+        return problem_response(
+            status=422,
+            title="Invalid audio frame",
+            detail="The submitted frame is not valid WebM/Opus for this audio stream.",
+            code="invalid_audio_frame",
+        )
+
+    @app.exception_handler(AudioTrackMismatch)
+    def handle_audio_track_mismatch(
+        _request: Request,
+        _error: AudioTrackMismatch,
+    ) -> JSONResponse:
+        return problem_response(
+            status=409,
+            title="Audio track mismatch",
+            detail="The submitted frame does not match the audio asset's track configuration.",
+            code="audio_track_mismatch",
+        )
+
+    @app.exception_handler(PlaybackSnapshotNotAvailable)
+    def handle_playback_snapshot_not_available(
+        _request: Request,
+        error: PlaybackSnapshotNotAvailable,
+    ) -> JSONResponse:
+        return problem_response(
+            status=409,
+            title="Playback snapshot not available",
+            detail="The requested frame count has not been acknowledged.",
+            code="playback_snapshot_not_available",
+            extensions={"currentFrameCount": error.current_frame_count},
+        )
+
+    @app.exception_handler(PlaybackRepresentationCorrupt)
+    def handle_playback_representation_corrupt(
+        _request: Request,
+        error: PlaybackRepresentationCorrupt,
+    ) -> JSONResponse:
+        logger.error(
+            "playback representation corrupt audio_asset_id=%s frame_count=%d",
+            error.audio_asset_id,
+            error.frame_count,
+        )
+        return problem_response(
+            status=500,
+            title="Playback representation corrupt",
+            detail="The playback representation could not be generated.",
+            code="playback_representation_corrupt",
         )
 
     @app.exception_handler(AudioAssetNotSealed)
@@ -319,6 +389,19 @@ def create_app(
             title="Upload concurrency limit exceeded",
             detail="Too many frame uploads are already active.",
             code="upload_concurrency_limit_exceeded",
+        )
+
+    @app.exception_handler(PlaybackConcurrencyLimitExceeded)
+    def handle_playback_concurrency_limit(
+        _request: Request,
+        error: PlaybackConcurrencyLimitExceeded,
+    ) -> JSONResponse:
+        logger.warning("playback concurrency limit exceeded scope=%s", error.args[0])
+        return problem_response(
+            status=429,
+            title="Playback concurrency limit exceeded",
+            detail="Too many playback responses are already active.",
+            code="playback_concurrency_limit_exceeded",
         )
 
     @app.exception_handler(DatabaseBusy)

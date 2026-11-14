@@ -3,6 +3,8 @@ from uuid import uuid4
 import pytest
 
 from running_drafts.request_limits import (
+    PlaybackCapacity,
+    PlaybackConcurrencyLimitExceeded,
     RequestLimiter,
     RequestRateLimitExceeded,
     UploadCapacity,
@@ -68,4 +70,22 @@ def test_seventeenth_process_upload_is_rejected() -> None:
     with pytest.raises(UploadConcurrencyLimitExceeded, match="process"):
         capacity.acquire(uuid4())
     for lease in leases:
+        lease.release()
+
+
+def test_playback_capacity_enforces_four_per_account_and_eight_process_wide() -> None:
+    account = uuid4()
+    capacity = PlaybackCapacity(per_account=4, process=8)
+    account_leases = [capacity.acquire(account) for _ in range(4)]
+    with pytest.raises(PlaybackConcurrencyLimitExceeded, match="account"):
+        capacity.acquire(account)
+
+    process_leases = [capacity.acquire(uuid4()) for _ in range(4)]
+    with pytest.raises(PlaybackConcurrencyLimitExceeded, match="process"):
+        capacity.acquire(uuid4())
+
+    account_leases[0].release()
+    replacement = capacity.acquire(account)
+    replacement.release()
+    for lease in account_leases[1:] + process_leases:
         lease.release()

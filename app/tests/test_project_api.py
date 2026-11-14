@@ -1,5 +1,6 @@
 import asyncio
 import errno
+import hashlib
 import json
 import os
 import sqlite3
@@ -23,10 +24,24 @@ from running_drafts.oauth import ProviderClaims
 from running_drafts.oauth_identities import resolve_or_provision_identity
 from running_drafts.project_api import project_storage
 from running_drafts.project_storage import ProjectStorage
+from running_drafts.request_limits import PlaybackCapacity
 from running_drafts.session_cookie import SESSION_COOKIE_NAME
 from running_drafts.settings import AppEnvironment, Settings
 
 MEDIARECORDER_FIXTURES = Path(__file__).parent / "fixtures" / "mediarecorder"
+DEFAULT_FRAME_PAYLOADS = tuple(
+    (MEDIARECORDER_FIXTURES / "chromium-completed" / f"frame-{sequence:03}.webm").read_bytes()
+    for sequence in range(3)
+)
+_FIREFOX_FIRST_FRAME = (
+    MEDIARECORDER_FIXTURES / "firefox-completed" / "frame-000.webm"
+).read_bytes()
+_FIREFOX_TRACKS_START = _FIREFOX_FIRST_FRAME.index(bytes.fromhex("1654ae6b"))
+_FIREFOX_TRACKS_END = _FIREFOX_FIRST_FRAME.index(
+    bytes.fromhex("1f43b675"),
+    _FIREFOX_TRACKS_START,
+)
+FIREFOX_TRACKS_ELEMENT = _FIREFOX_FIRST_FRAME[_FIREFOX_TRACKS_START:_FIREFOX_TRACKS_END]
 AUTH_TOKENS: dict[str, str] = {}
 
 
@@ -127,12 +142,14 @@ def upload_frame(
     audio_asset_id: str,
     sequence: int,
     *,
-    payload: bytes = b"frame-one",
+    payload: bytes | None = None,
     start_ms: int = 0,
     end_ms: int = 1_000,
     content_type: str = "audio/webm;codecs=opus",
     username: str = "Alice",
 ):
+    if payload is None:
+        payload = DEFAULT_FRAME_PAYLOADS[sequence]
     return client.put(
         f"/api/v1/audio-assets/{audio_asset_id}/frames/{sequence}",
         content=payload,
@@ -289,20 +306,21 @@ def test_audio_frame_upload_is_acknowledged_and_visible_in_project_detail(
     assert uploaded.json() == {
         "sequence": 0,
         "acknowledged": True,
-        "sha256": "70a09fbff3df33ed9f6db65155e3a6e166de73e2ceab15d42103d688fc904eaa",
+        "sha256": hashlib.sha256(DEFAULT_FRAME_PAYLOADS[0]).hexdigest(),
         "nextExpectedSequence": 1,
     }
     asset = detail.json()["document"]["sections"][0]["audioAsset"]
     assert asset["frameCount"] == 1
     assert asset["observedDurationMs"] == 1_000
-    assert asset["storedBytes"] == 9
+    assert asset["storedBytes"] == len(DEFAULT_FRAME_PAYLOADS[0])
 
 
 def test_audio_frame_upload_enforces_body_media_and_timing_rules(
     database_path: Path,
 ) -> None:
+    exact_payload = DEFAULT_FRAME_PAYLOADS[0]
     settings = settings_for(database_path).model_copy(
-        update={"max_transport_frame_bytes": 8}
+        update={"max_transport_frame_bytes": len(exact_payload)}
     )
     with TestClient(create_app(settings)) as test_client:
         project = create_project(test_client)
@@ -312,7 +330,7 @@ def test_audio_frame_upload_enforces_body_media_and_timing_rules(
         zero = upload_frame(test_client, section["audioAssetId"], 0, payload=b"")
         oversized = test_client.put(
             endpoint,
-            content=b"123456789",
+            content=exact_payload + b"x",
             headers=auth()
             | {
                 "Content-Type": "audio/webm;codecs=opus",
@@ -340,7 +358,7 @@ def test_audio_frame_upload_enforces_body_media_and_timing_rules(
             test_client,
             section["audioAssetId"],
             0,
-            payload=b"12345678",
+            payload=exact_payload,
         )
 
     assert zero.status_code == 422
@@ -365,7 +383,6 @@ def test_audio_frame_http_replays_and_conflicts_follow_asset_state(
         client,
         asset_id,
         1,
-        payload=b"frame-two",
         start_ms=1_000,
         end_ms=2_000,
     )
@@ -418,6 +435,45 @@ def test_audio_frame_http_replays_and_conflicts_follow_asset_state(
     assert sealed.status_code == 200
     assert replay_after_seal.status_code == 200
     assert replay_after_seal.json()["nextExpectedSequence"] == 2
+
+
+def test_invalid_and_mismatched_audio_frames_roll_back_before_acknowledgement(
+    client: TestClient,
+) -> None:
+    project = create_project(client, title="Validation")
+    section, _response = create_section(client, project["id"])
+    asset_id = section["audioAssetId"]
+
+    invalid = upload_frame(client, asset_id, 0, payload=b"not-webm")
+    assert invalid.status_code == 422
+    assert invalid.json()["code"] == "invalid_audio_frame"
+    detail = client.get(f"/api/v1/projects/{project['id']}", headers=auth()).json()
+    asset = detail["document"]["sections"][0]["audioAsset"]
+    assert asset["frameCount"] == 0
+    assert asset["storedBytes"] == 0
+
+    for sequence in range(3):
+        assert upload_frame(
+            client,
+            asset_id,
+            sequence,
+            start_ms=sequence * 1_000,
+            end_ms=(sequence + 1) * 1_000,
+        ).status_code == 200
+    mismatched = upload_frame(
+        client,
+        asset_id,
+        3,
+        payload=FIREFOX_TRACKS_ELEMENT,
+        start_ms=3_000,
+        end_ms=4_000,
+    )
+    assert mismatched.status_code == 409
+    assert mismatched.json()["code"] == "audio_track_mismatch"
+    detail = client.get(f"/api/v1/projects/{project['id']}", headers=auth()).json()
+    asset = detail["document"]["sections"][0]["audioAsset"]
+    assert asset["frameCount"] == 3
+    assert asset["storedBytes"] == sum(map(len, DEFAULT_FRAME_PAYLOADS))
 
 
 def test_cross_user_access_is_privacy_preserving(client: TestClient) -> None:
@@ -512,13 +568,12 @@ def test_sealed_audio_download_returns_exact_ordered_frames(client: TestClient) 
     project = create_project(client, title="October Notes")
     section, _response = create_section(client, project["id"])
     asset_id = section["audioAssetId"]
-    assert upload_frame(client, asset_id, 0, payload=b"frame-one").status_code == 200
+    assert upload_frame(client, asset_id, 0).status_code == 200
     assert (
         upload_frame(
             client,
             asset_id,
             1,
-            payload=b"frame-two",
             start_ms=1_000,
             end_ms=2_000,
         ).status_code
@@ -537,9 +592,11 @@ def test_sealed_audio_download_returns_exact_ordered_frames(client: TestClient) 
     )
 
     assert downloaded.status_code == 200
-    assert downloaded.content == b"frame-oneframe-two"
+    assert downloaded.content == b"".join(DEFAULT_FRAME_PAYLOADS[:2])
     assert downloaded.headers["content-type"] == "audio/webm;codecs=opus"
-    assert downloaded.headers["content-length"] == "18"
+    assert downloaded.headers["content-length"] == str(
+        sum(len(frame) for frame in DEFAULT_FRAME_PAYLOADS[:2])
+    )
     assert downloaded.headers["content-disposition"] == (
         'attachment; filename="October-Notes-section-1.webm"; '
         "filename*=UTF-8''October-Notes-section-1.webm"
@@ -609,6 +666,192 @@ def test_zero_frame_download_uses_empty_fixture_and_unicode_filename(
     assert "Content-Disposition" in downloaded.headers["access-control-expose-headers"]
 
 
+def test_playback_latest_snapshot_full_head_and_historical_stability(
+    client: TestClient,
+) -> None:
+    project = create_project(client, title="Playback")
+    section, _response = create_section(client, project["id"])
+    asset_id = section["audioAssetId"]
+    assert upload_frame(client, asset_id, 0).status_code == 200
+
+    latest = client.get(
+        f"/api/v1/audio-assets/{asset_id}/playback/latest",
+        headers=auth(),
+        follow_redirects=False,
+    )
+    assert latest.status_code == 307
+    assert latest.headers["location"].endswith("/playback/snapshots/1")
+    assert latest.headers["cache-control"] == "private, no-store"
+
+    snapshot_url = latest.headers["location"]
+    first = client.get(snapshot_url, headers=auth())
+    assert first.status_code == 200
+    assert first.headers["content-type"] == "audio/webm;codecs=opus"
+    assert first.headers["accept-ranges"] == "bytes"
+    assert first.headers["cache-control"] == "private, max-age=31536000, immutable"
+    assert first.headers["content-length"] == str(len(first.content))
+    assert first.headers["etag"].startswith('"playback-v1-')
+    assert "content-disposition" not in first.headers
+    assert "content-encoding" not in first.headers
+
+    head = client.head(snapshot_url, headers=auth())
+    assert head.status_code == 200
+    assert not head.content
+    assert head.headers["content-length"] == str(len(first.content))
+    assert head.headers["etag"] == first.headers["etag"]
+
+    assert upload_frame(
+        client,
+        asset_id,
+        1,
+        start_ms=1_000,
+        end_ms=2_000,
+    ).status_code == 200
+    assert client.get(snapshot_url, headers=auth()).content == first.content
+    newer_latest = client.head(
+        f"/api/v1/audio-assets/{asset_id}/playback/latest",
+        headers=auth(),
+        follow_redirects=False,
+    )
+    assert newer_latest.status_code == 307
+    assert newer_latest.headers["location"].endswith("/playback/snapshots/2")
+
+
+def test_playback_single_ranges_and_validators(client: TestClient) -> None:
+    project = create_project(client, title="Ranges")
+    section, _response = create_section(client, project["id"])
+    asset_id = section["audioAssetId"]
+    assert upload_frame(client, asset_id, 0).status_code == 200
+    url = f"/api/v1/audio-assets/{asset_id}/playback/snapshots/1"
+    full = client.get(url, headers=auth())
+    etag = full.headers["etag"]
+
+    bounded = client.get(url, headers=auth() | {"Range": "bytes=17-116"})
+    assert bounded.status_code == 206
+    assert bounded.content == full.content[17:117]
+    assert bounded.headers["content-range"] == f"bytes 17-116/{len(full.content)}"
+    assert bounded.headers["content-length"] == "100"
+
+    suffix = client.get(url, headers=auth() | {"Range": "bytes=-31"})
+    assert suffix.status_code == 206
+    assert suffix.content == full.content[-31:]
+
+    not_modified = client.get(
+        url,
+        headers=auth() | {"If-None-Match": etag, "Range": "bytes=0-9"},
+    )
+    assert not_modified.status_code == 304
+    assert not not_modified.content
+    weak_not_modified = client.get(
+        url,
+        headers=auth() | {"If-None-Match": f"W/{etag}"},
+    )
+    assert weak_not_modified.status_code == 304
+
+    if_range = client.get(
+        url,
+        headers=auth() | {"If-Range": etag, "Range": "bytes=0-9"},
+    )
+    assert if_range.status_code == 206
+    assert if_range.content == full.content[:10]
+
+    cases = [
+        ("items=0-9", 400, "invalid_range"),
+        ("bytes=broken", 400, "invalid_range"),
+        ("bytes=0-1,4-5", 416, "multiple_ranges_not_supported"),
+        (f"bytes={len(full.content)}-", 416, "range_not_satisfiable"),
+    ]
+    for range_value, expected_status, code in cases:
+        response = client.get(url, headers=auth() | {"Range": range_value})
+        assert response.status_code == expected_status
+        assert response.json()["code"] == code
+        if expected_status == 416:
+            assert response.headers["content-range"] == f"bytes */{len(full.content)}"
+
+
+def test_large_playback_requires_and_caps_ranges(
+    database_path: Path,
+    client: TestClient,
+) -> None:
+    project = create_project(client, title="Capped ranges")
+    section, _response = create_section(client, project["id"])
+    asset_id = section["audioAssetId"]
+    assert upload_frame(client, asset_id, 0).status_code == 200
+    url = f"/api/v1/audio-assets/{asset_id}/playback/snapshots/1"
+    capped_settings = settings_for(database_path).model_copy(
+        update={"max_playback_response_bytes": 1_024}
+    )
+    with TestClient(create_app(capped_settings)) as capped:
+        unranged = capped.get(url, headers=auth())
+        assert unranged.status_code == 400
+        assert unranged.json()["code"] == "range_required"
+
+        head = capped.head(url, headers=auth())
+        assert head.status_code == 200
+        total = int(head.headers["content-length"])
+        etag = head.headers["etag"]
+
+        open_ended = capped.get(url, headers=auth() | {"Range": "bytes=0-"})
+        assert open_ended.status_code == 206
+        assert len(open_ended.content) == 1_024
+        assert open_ended.headers["content-range"] == f"bytes 0-1023/{total}"
+
+        oversized_finite = capped.get(url, headers=auth() | {"Range": "bytes=7-99999"})
+        assert oversized_finite.status_code == 206
+        assert len(oversized_finite.content) == 1_024
+
+        oversized_suffix = capped.get(url, headers=auth() | {"Range": "bytes=-1025"})
+        assert oversized_suffix.status_code == 416
+        assert oversized_suffix.json()["code"] == "range_too_large"
+
+        mismatched_if_range = capped.get(
+            url,
+            headers=auth() | {"Range": "bytes=0-9", "If-Range": '"wrong"'},
+        )
+        assert mismatched_if_range.status_code == 400
+        assert mismatched_if_range.json()["code"] == "range_required"
+        assert mismatched_if_range.headers["etag"] == etag
+
+
+def test_playback_zero_future_and_ownership(client: TestClient) -> None:
+    project = create_project(client, title="Playback states")
+    section, _response = create_section(client, project["id"])
+    asset_id = section["audioAssetId"]
+    zero_url = f"/api/v1/audio-assets/{asset_id}/playback/snapshots/0"
+    zero = client.get(zero_url, headers=auth())
+    assert zero.status_code == 200
+    assert zero.content == files("running_drafts").joinpath("assets/empty-audio.webm").read_bytes()
+
+    future = client.get(
+        f"/api/v1/audio-assets/{asset_id}/playback/snapshots/1",
+        headers=auth(),
+    )
+    assert future.status_code == 409
+    assert future.json()["code"] == "playback_snapshot_not_available"
+    assert future.json()["currentFrameCount"] == 0
+
+    assert client.get(zero_url, headers=auth("Bob")).status_code == 404
+    assert client.get(zero_url).status_code == 401
+
+
+def test_playback_capacity_failure_is_publicly_scopeless(client: TestClient) -> None:
+    project = create_project(client, title="Playback capacity")
+    section, _response = create_section(client, project["id"])
+    asset_id = section["audioAssetId"]
+    assert upload_frame(client, asset_id, 0).status_code == 200
+    client.app.state.playback_capacity = PlaybackCapacity(per_account=0, process=0)
+
+    response = client.get(
+        f"/api/v1/audio-assets/{asset_id}/playback/snapshots/1",
+        headers=auth(),
+    )
+
+    assert response.status_code == 429
+    assert response.json()["code"] == "playback_concurrency_limit_exceeded"
+    assert "retry-after" not in response.headers
+    assert "scope" not in response.json()
+
+
 def test_download_filename_preserves_suffix_within_utf8_length_limit(
     client: TestClient,
 ) -> None:
@@ -646,7 +889,7 @@ def test_inconsistent_audio_download_returns_bounded_assembly_failure(
     project = create_project(client)
     section, _response = create_section(client, project["id"])
     asset_id = section["audioAssetId"]
-    assert upload_frame(client, asset_id, 0, payload=b"frame").status_code == 200
+    assert upload_frame(client, asset_id, 0).status_code == 200
     assert (
         client.post(
             f"/api/v1/audio-assets/{asset_id}/complete",
@@ -675,8 +918,8 @@ def test_inconsistent_audio_download_returns_bounded_assembly_failure(
     message = record.getMessage()
     assert f"audio_asset_id={asset_id}" in message
     assert "expected_bytes=999" in message
-    assert "actual_bytes=5" in message
-    assert message.count("9dff50df08c635815f4b19da10f756605a34a79a48d4ba48712782502975a70e") == 1
+    assert f"actual_bytes={len(DEFAULT_FRAME_PAYLOADS[0])}" in message
+    assert message.count(hashlib.sha256(DEFAULT_FRAME_PAYLOADS[0]).hexdigest()) == 1
 
 
 def test_temporary_disk_exhaustion_returns_storage_unavailable(
@@ -686,7 +929,7 @@ def test_temporary_disk_exhaustion_returns_storage_unavailable(
     project = create_project(client)
     section, _response = create_section(client, project["id"])
     asset_id = section["audioAssetId"]
-    assert upload_frame(client, asset_id, 0, payload=b"frame").status_code == 200
+    assert upload_frame(client, asset_id, 0).status_code == 200
     assert (
         client.post(
             f"/api/v1/audio-assets/{asset_id}/complete",
@@ -724,7 +967,7 @@ def test_download_capacity_rejects_before_staging_and_returns_after_streaming(
     project = create_project(client)
     section, _response = create_section(client, project["id"])
     asset_id = section["audioAssetId"]
-    assert upload_frame(client, asset_id, 0, payload=b"frame").status_code == 200
+    assert upload_frame(client, asset_id, 0).status_code == 200
     assert (
         client.post(
             f"/api/v1/audio-assets/{asset_id}/complete",
@@ -814,7 +1057,7 @@ def test_client_disconnect_closes_staged_file_and_releases_capacity(
     project = create_project(client)
     section, _response = create_section(client, project["id"])
     asset_id = section["audioAssetId"]
-    payload = b"x" * (128 * 1024)
+    payload = DEFAULT_FRAME_PAYLOADS[0]
     assert upload_frame(client, asset_id, 0, payload=payload).status_code == 200
     assert (
         client.post(
@@ -911,7 +1154,7 @@ def test_disconnect_before_first_body_closes_file_and_releases_capacity(
     project = create_project(client)
     section, _response = create_section(client, project["id"])
     asset_id = section["audioAssetId"]
-    assert upload_frame(client, asset_id, 0, payload=b"frame").status_code == 200
+    assert upload_frame(client, asset_id, 0).status_code == 200
     assert (
         client.post(
             f"/api/v1/audio-assets/{asset_id}/complete",
@@ -1088,6 +1331,8 @@ def test_openapi_declares_routes_security_locations_and_problem_details(
         "/api/v1/audio-assets/{audio_asset_id}/complete",
         "/api/v1/audio-assets/{audio_asset_id}/interrupt",
         "/api/v1/audio-assets/{audio_asset_id}/download",
+        "/api/v1/audio-assets/{audio_asset_id}/playback/latest",
+        "/api/v1/audio-assets/{audio_asset_id}/playback/snapshots/{frame_count}",
         "/api/v1/me/usage",
     } <= paths.keys()
     create_operation = paths["/api/v1/projects"]["post"]
@@ -1147,6 +1392,36 @@ def test_openapi_declares_routes_security_locations_and_problem_details(
             "application/problem+json"
             in download_operation["responses"][status_code]["content"]
         )
+    latest_path = paths[
+        "/api/v1/audio-assets/{audio_asset_id}/playback/latest"
+    ]
+    assert {"get", "head"} <= latest_path.keys()
+    for method in ("get", "head"):
+        assert latest_path[method]["security"] == [{"ApplicationSession": []}]
+        assert "307" in latest_path[method]["responses"]
+
+    snapshot_path = paths[
+        "/api/v1/audio-assets/{audio_asset_id}/playback/snapshots/{frame_count}"
+    ]
+    assert {"get", "head"} <= snapshot_path.keys()
+    for method in ("get", "head"):
+        operation = snapshot_path[method]
+        assert operation["security"] == [{"ApplicationSession": []}]
+        assert {"200", "206", "304", "400", "409", "416", "429", "500"} <= set(
+            operation["responses"]
+        )
+        assert {
+            "Accept-Ranges",
+            "Cache-Control",
+            "Content-Length",
+            "Content-Range",
+            "ETag",
+        } <= set(operation["responses"]["206"]["headers"])
+        assert operation["responses"]["206"]["content"] == {
+            "audio/webm;codecs=opus": {
+                "schema": {"type": "string", "format": "binary"}
+            }
+        }
 
 
 def test_busy_mutation_returns_retryable_problem_details(
@@ -1208,4 +1483,4 @@ def test_failed_frame_transaction_is_not_acknowledged_and_can_be_retried(
     assert replay.status_code == 200
     asset = detail.json()["document"]["sections"][0]["audioAsset"]
     assert asset["frameCount"] == 1
-    assert asset["storedBytes"] == 9
+    assert asset["storedBytes"] == len(DEFAULT_FRAME_PAYLOADS[0])

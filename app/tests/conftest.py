@@ -19,6 +19,9 @@ def api_limit_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> No
         "MAX_ACCOUNT_CONCURRENT_FRAME_UPLOADS": "200",
         "MAX_PROCESS_CONCURRENT_FRAME_UPLOADS": "1600",
         "MAX_STAGED_DOWNLOAD_FILES": "200",
+        "MAX_PLAYBACK_RESPONSE_BYTES": "1572864",
+        "MAX_ACCOUNT_CONCURRENT_PLAYBACK_RESPONSES": "4",
+        "MAX_PROCESS_CONCURRENT_PLAYBACK_RESPONSES": "8",
     }
     for name, value in values.items():
         monkeypatch.setenv(name, value)

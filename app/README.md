@@ -15,8 +15,9 @@ are rejected.
 The API has no defaults for capacity settings. The checked-in environment
 samples explicitly configure the 2 MiB transport-frame bound, Account/process
 request rates and bursts, Account/process upload concurrency, and the
-two-file staged-download limit. The `db-admin` process does not require these
-API-only settings.
+two-file staged-download limit. They also configure immutable playback responses
+at 1.5 MiB per response, four concurrent responses per Account, and eight per
+API process. The `db-admin` process does not require these API-only settings.
 
 `DATABASE_MIN_FREE_BYTES` applies to the filesystem containing
 `DATABASE_PATH`. `STAGING_MIN_FREE_BYTES` applies independently to the
@@ -135,6 +136,26 @@ Grant create/patch/remove, Downgrade Grant patch/remove, and Account
 suspend/reinstate commands. Mutations require an explicit Account UUID and
 reason and emit a structured success event. Suspension deletes existing
 Application Sessions without deleting Account data.
+
+## Incremental playback
+
+Each accepted browser WebM/Opus frame updates a transactional playback index.
+The original compressed Opus packets remain in `transport_frames`; playback
+does not re-encode them or materialize a complete snapshot or temporary file.
+Authenticated clients resolve the current immutable URL with
+`GET /api/v1/audio-assets/{audio_asset_id}/playback/latest`, then use single
+HTTP byte ranges against
+`/api/v1/audio-assets/{audio_asset_id}/playback/snapshots/{frame_count}`.
+Snapshots have stable bytes, lengths, and strong ETags. `HEAD` returns metadata
+without generating media. The latest redirect is not cacheable; immutable
+snapshots are private and cacheable for one year.
+
+The server caps each response with `MAX_PLAYBACK_RESPONSE_BYTES`. A large
+resource requested without `Range` is rejected, while open-ended and oversized
+start-based ranges return at most that many bytes with `206 Partial Content`.
+Suffix ranges larger than the cap, multiple ranges, and unsatisfiable ranges are
+rejected. `MAX_ACCOUNT_CONCURRENT_PLAYBACK_RESPONSES` and
+`MAX_PROCESS_CONCURRENT_PLAYBACK_RESPONSES` independently bound active bodies.
 
 ## Database space maintenance
 
