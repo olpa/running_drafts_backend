@@ -16,6 +16,9 @@ LAUNCH_LIMITS = {
     "MAX_ACCOUNT_CONCURRENT_FRAME_UPLOADS": "2",
     "MAX_PROCESS_CONCURRENT_FRAME_UPLOADS": "16",
     "MAX_STAGED_DOWNLOAD_FILES": "2",
+    "MAX_PLAYBACK_RESPONSE_BYTES": "1572864",
+    "MAX_ACCOUNT_CONCURRENT_PLAYBACK_RESPONSES": "4",
+    "MAX_PROCESS_CONCURRENT_PLAYBACK_RESPONSES": "8",
 }
 
 
@@ -43,6 +46,9 @@ def test_compose_publishes_separate_api_and_database_admin_services() -> None:
     assert "application-data" in configuration["volumes"]
     assert configuration["services"]["api"]["build"]["target"] == "api"
     assert configuration["services"]["api"]["environment"]["MAX_STAGED_DOWNLOAD_FILES"] == "2"
+    assert configuration["services"]["api"]["environment"][
+        "MAX_PLAYBACK_RESPONSE_BYTES"
+    ] == "1572864"
     assert "download-staging" in configuration["volumes"]
     assert configuration["services"]["api"]["environment"][
         "TEST_CONTROL_BOOTSTRAP_CREDENTIAL"

@@ -1,3 +1,4 @@
+import re
 import unicodedata
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
@@ -7,7 +8,7 @@ from urllib.parse import quote
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, Path, Request, Response, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import Field, field_validator
 from starlette.concurrency import run_in_threadpool
 
@@ -27,7 +28,12 @@ from running_drafts.project_storage import (
     canonicalize_media_type,
     normalize_title,
 )
-from running_drafts.request_limits import RequestLimiter, UploadCapacity
+from running_drafts.request_limits import (
+    PlaybackCapacity,
+    PlaybackLease,
+    RequestLimiter,
+    UploadCapacity,
+)
 from running_drafts.settings import Settings
 
 MAX_SQLITE_INTEGER = 2**63 - 1
@@ -81,6 +87,18 @@ class ManagedDownloadResponse(StreamingResponse):
             await super().__call__(scope, receive, send)
         finally:
             self._lease.close()
+
+
+class ManagedPlaybackResponse(StreamingResponse):
+    def __init__(self, lease: PlaybackLease, content: Iterator[bytes], **kwargs: Any) -> None:
+        self._playback_lease = lease
+        super().__init__(content, **kwargs)
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._playback_lease.release()
 
 
 class CreateProjectRequest(CamelCaseRequest):
@@ -432,6 +450,43 @@ DOWNLOAD_RESPONSES = CONFLICT_RESPONSES | {
     500: _problem_response("Audio assembly failed"),
     503: _problem_response("Database or temporary storage unavailable"),
 }
+PLAYBACK_RESPONSES = CONFLICT_RESPONSES | {
+    200: {
+        "description": "Complete immutable playback snapshot",
+        "content": {
+            "audio/webm;codecs=opus": {
+                "schema": {"type": "string", "format": "binary"},
+            }
+        },
+        "headers": {
+            name: {"schema": {"type": "string"}}
+            for name in ("Accept-Ranges", "Cache-Control", "Content-Length", "ETag")
+        },
+    },
+    206: {
+        "description": "Single byte range from an immutable playback snapshot",
+        "content": {
+            "audio/webm;codecs=opus": {
+                "schema": {"type": "string", "format": "binary"},
+            }
+        },
+        "headers": {
+            name: {"schema": {"type": "string"}}
+            for name in (
+                "Accept-Ranges",
+                "Cache-Control",
+                "Content-Length",
+                "Content-Range",
+                "ETag",
+            )
+        },
+    },
+    304: {"description": "Snapshot validator matched"},
+    400: _problem_response("A byte range is required or malformed"),
+    416: _problem_response("The requested byte range cannot be satisfied"),
+    429: _problem_response("Concurrent playback limit exceeded"),
+    500: _problem_response("Playback representation corrupt"),
+}
 CREATED_RESPONSE = {
     "headers": {
         "Location": {
@@ -691,4 +746,222 @@ def download_audio_asset(
         )
     except BaseException:
         lease.close()
+        raise
+
+
+def _playback_problem(
+    status_code: int,
+    title: str,
+    detail: str,
+    code: str,
+    *,
+    total: int,
+    etag: str,
+    include_content_range: bool = False,
+) -> ProblemException:
+    headers = {"Accept-Ranges": "bytes", "ETag": etag}
+    if include_content_range:
+        headers["Content-Range"] = f"bytes */{total}"
+    return ProblemException(
+        status=status_code,
+        title=title,
+        detail=detail,
+        code=code,
+        headers=headers,
+    )
+
+
+_SINGLE_RANGE = re.compile(r"^bytes=(\d*)-(\d*)$")
+
+
+def _playback_interval(
+    value: str | None,
+    *,
+    total: int,
+    maximum: int,
+    etag: str,
+) -> tuple[int, int, int]:
+    if value is None:
+        if total > maximum:
+            raise _playback_problem(
+                400,
+                "Byte range required",
+                "This playback representation is too large for an un-ranged response.",
+                "range_required",
+                total=total,
+                etag=etag,
+            )
+        return 0, total, 200
+    if "," in value:
+        raise _playback_problem(
+            416,
+            "Multiple ranges are not supported",
+            "Playback supports exactly one byte range per request.",
+            "multiple_ranges_not_supported",
+            total=total,
+            etag=etag,
+            include_content_range=True,
+        )
+    match = _SINGLE_RANGE.fullmatch(value.strip())
+    if match is None or (not match.group(1) and not match.group(2)):
+        raise _playback_problem(
+            400,
+            "Invalid byte range",
+            "Range must contain one valid bytes interval.",
+            "invalid_range",
+            total=total,
+            etag=etag,
+        )
+    start_text, end_text = match.groups()
+    if not start_text:
+        suffix = int(end_text)
+        if suffix == 0:
+            raise _playback_problem(
+                416,
+                "Byte range not satisfiable",
+                "The suffix byte range cannot be satisfied.",
+                "range_not_satisfiable",
+                total=total,
+                etag=etag,
+                include_content_range=True,
+            )
+        if suffix > maximum:
+            raise _playback_problem(
+                416,
+                "Byte range too large",
+                "The suffix byte range exceeds the playback response limit.",
+                "range_too_large",
+                total=total,
+                etag=etag,
+                include_content_range=True,
+            )
+        return max(0, total - suffix), total, 206
+
+    start = int(start_text)
+    if start >= total:
+        raise _playback_problem(
+            416,
+            "Byte range not satisfiable",
+            "The byte range begins beyond the representation.",
+            "range_not_satisfiable",
+            total=total,
+            etag=etag,
+            include_content_range=True,
+        )
+    if end_text:
+        requested_end = int(end_text)
+        if requested_end < start:
+            raise _playback_problem(
+                416,
+                "Byte range not satisfiable",
+                "The byte range end precedes its start.",
+                "range_not_satisfiable",
+                total=total,
+                etag=etag,
+                include_content_range=True,
+            )
+        end = min(total, requested_end + 1, start + maximum)
+    else:
+        end = min(total, start + maximum)
+    return start, end, 206
+
+
+def _etag_matches(value: str, etag: str) -> bool:
+    def opaque_tag(tag: str) -> str:
+        tag = tag.strip()
+        return tag[2:].lstrip() if tag.startswith("W/") else tag
+
+    return value.strip() == "*" or opaque_tag(etag) in {
+        opaque_tag(item) for item in value.split(",")
+    }
+
+
+@router.get(
+    "/audio-assets/{audio_asset_id}/playback/latest",
+    operation_id="get_latest_playback_snapshot",
+    responses=NOT_FOUND_RESPONSES | {307: {"description": "Current immutable snapshot"}},
+)
+@router.head(
+    "/audio-assets/{audio_asset_id}/playback/latest",
+    operation_id="head_latest_playback_snapshot",
+    responses=NOT_FOUND_RESPONSES | {307: {"description": "Current immutable snapshot"}},
+)
+def latest_playback_snapshot(
+    audio_asset_id: UUID4,
+    user_id: AuthenticatedUser,
+    storage: Storage,
+) -> Response:
+    frame_count = storage.latest_playback_frame_count(user_id, audio_asset_id)
+    return RedirectResponse(
+        url=f"/api/v1/audio-assets/{audio_asset_id}/playback/snapshots/{frame_count}",
+        status_code=307,
+        headers={"Cache-Control": "private, no-store"},
+    )
+
+
+@router.get(
+    "/audio-assets/{audio_asset_id}/playback/snapshots/{frame_count}",
+    operation_id="get_playback_snapshot",
+    responses=PLAYBACK_RESPONSES,
+)
+@router.head(
+    "/audio-assets/{audio_asset_id}/playback/snapshots/{frame_count}",
+    operation_id="head_playback_snapshot",
+    responses=PLAYBACK_RESPONSES,
+)
+def playback_snapshot(
+    request: Request,
+    audio_asset_id: UUID4,
+    frame_count: Annotated[int, Path(ge=0, le=MAX_SQLITE_INTEGER)],
+    user_id: AuthenticatedUser,
+    storage: Storage,
+) -> Response:
+    snapshot = storage.playback_snapshot(user_id, audio_asset_id, frame_count)
+    common_headers = {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "private, max-age=31536000, immutable",
+        "ETag": snapshot.etag,
+        "X-Content-Type-Options": "nosniff",
+    }
+    if_none_match = request.headers.get("if-none-match")
+    if if_none_match is not None and _etag_matches(if_none_match, snapshot.etag):
+        return Response(status_code=304, headers=common_headers)
+
+    requested_range = request.headers.get("range")
+    if_range = request.headers.get("if-range")
+    if if_range is not None and if_range.strip() != snapshot.etag:
+        requested_range = None
+    settings: Settings = request.app.state.settings
+    if request.method == "HEAD" and requested_range is None:
+        start, end, response_status = 0, snapshot.total_length, 200
+    else:
+        start, end, response_status = _playback_interval(
+            requested_range,
+            total=snapshot.total_length,
+            maximum=settings.max_playback_response_bytes,
+            etag=snapshot.etag,
+        )
+    content_length = end - start
+    headers = common_headers | {"Content-Length": str(content_length)}
+    if response_status == 206:
+        headers["Content-Range"] = f"bytes {start}-{end - 1}/{snapshot.total_length}"
+    if request.method == "HEAD":
+        return Response(
+            status_code=response_status,
+            media_type="audio/webm;codecs=opus",
+            headers=headers,
+        )
+
+    capacity: PlaybackCapacity = request.app.state.playback_capacity
+    lease = capacity.acquire(user_id)
+    try:
+        return ManagedPlaybackResponse(
+            lease,
+            storage.playback_range(snapshot, start, end),
+            status_code=response_status,
+            media_type="audio/webm;codecs=opus",
+            headers=headers,
+        )
+    except BaseException:
+        lease.release()
         raise

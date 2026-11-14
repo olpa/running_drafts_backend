@@ -36,6 +36,13 @@ from running_drafts.test_control import (
 BOOTSTRAP = "bootstrap-credential"
 DERIVATION_KEY = "derivation-key"
 ORIGIN = "https://editor.test"
+FRAME = (
+    Path(__file__).parent
+    / "fixtures"
+    / "mediarecorder"
+    / "firefox-completed"
+    / "frame-000.webm"
+).read_bytes()
 
 
 def migrate_database(path: Path) -> None:
@@ -276,7 +283,7 @@ def test_reset_cascades_fixture_state_and_preserves_unrelated_state(tmp_path: Pa
         )
         uploaded = client.put(
             f"/api/v1/audio-assets/{section.json()['audioAssetId']}/frames/0",
-            content=b"frame",
+                content=FRAME,
             headers={
                 "Origin": ORIGIN,
                 "Content-Type": "audio/webm;codecs=opus",

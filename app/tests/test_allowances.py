@@ -23,6 +23,13 @@ from running_drafts.storage_accounting import (
 )
 
 ACCOUNT_ID = UUID("00000000-0000-4000-8000-000000000001")
+FRAME = (
+    Path(__file__).parent
+    / "fixtures"
+    / "mediarecorder"
+    / "firefox-completed"
+    / "frame-000.webm"
+).read_bytes()
 
 
 def database(tmp_path: Path) -> Path:
@@ -91,7 +98,7 @@ def test_frame_allowances_charge_once_and_storage_wins(tmp_path: Path) -> None:
     with sqlite3.connect(path) as connection:
         connection.execute(
             "UPDATE users SET stored_audio_bytes = ? WHERE id = ?",
-            (134_217_727, str(ACCOUNT_ID)),
+            (134_217_728 - len(FRAME), str(ACCOUNT_ID)),
         )
 
     accepted = storage.accept_audio_frame(
@@ -101,7 +108,7 @@ def test_frame_allowances_charge_once_and_storage_wins(tmp_path: Path) -> None:
         start_ms=0,
         end_ms=3_600_000,
         media_type="audio/webm;codecs=opus",
-        payload=b"x",
+        payload=FRAME,
     )
     replayed = storage.accept_audio_frame(
         ACCOUNT_ID,
@@ -110,7 +117,7 @@ def test_frame_allowances_charge_once_and_storage_wins(tmp_path: Path) -> None:
         start_ms=0,
         end_ms=3_600_000,
         media_type="audio/webm;codecs=opus",
-        payload=b"x",
+        payload=FRAME,
     )
     assert accepted == replayed
     assert storage.account_usage(ACCOUNT_ID).used_storage_bytes == 134_217_728
@@ -192,7 +199,7 @@ def test_exact_retry_bypasses_database_reserve_check(
         start_ms=0,
         end_ms=1,
         media_type="audio/webm;codecs=opus",
-        payload=b"x",
+        payload=FRAME,
     )
 
     def unavailable(*_args, **_kwargs) -> None:
@@ -208,11 +215,11 @@ def test_exact_retry_bypasses_database_reserve_check(
         start_ms=0,
         end_ms=1,
         media_type="audio/webm;codecs=opus",
-        payload=b"x",
+        payload=FRAME,
     )
     assert replay == accepted
-    assert storage.account_usage(ACCOUNT_ID).used_storage_bytes == 1
-    assert storage.used_audio_bytes(ACCOUNT_ID) == 1
+    assert storage.account_usage(ACCOUNT_ID).used_storage_bytes == len(FRAME)
+    assert storage.used_audio_bytes(ACCOUNT_ID) == len(FRAME)
     with pytest.raises(DownloadStorageUnavailable):
         storage.accept_audio_frame(
             ACCOUNT_ID,
@@ -231,8 +238,8 @@ def test_concurrent_assets_race_by_transaction_order_at_storage_limit(tmp_path: 
     second_storage, second_asset = storage_with_asset(path)
     with sqlite3.connect(path) as connection:
         connection.execute(
-            "UPDATE users SET stored_audio_bytes = 134217727 WHERE id = ?",
-            (str(ACCOUNT_ID),),
+            "UPDATE users SET stored_audio_bytes = ? WHERE id = ?",
+            (134_217_728 - len(FRAME), str(ACCOUNT_ID)),
         )
 
     def accept(storage: ProjectStorage, asset_id: UUID) -> str:
@@ -244,7 +251,7 @@ def test_concurrent_assets_race_by_transaction_order_at_storage_limit(tmp_path: 
                 start_ms=0,
                 end_ms=1,
                 media_type="audio/webm;codecs=opus",
-                payload=b"x",
+                payload=FRAME,
             )
         except AudioStorageLimitExceeded:
             return "rejected"
@@ -271,21 +278,21 @@ def test_storage_accounting_invariant_uses_committed_frames_as_source_of_truth(
         start_ms=0,
         end_ms=1,
         media_type="audio/webm;codecs=opus",
-        payload=b"frame",
+        payload=FRAME,
     )
 
     invariant = storage.storage_accounting_invariant(ACCOUNT_ID)
     assert invariant.is_consistent
-    assert invariant.account_stored_bytes == 5
+    assert invariant.account_stored_bytes == len(FRAME)
 
     with sqlite3.connect(path) as connection:
         connection.execute(
-            "UPDATE users SET stored_audio_bytes = 4 WHERE id = ?",
-            (str(ACCOUNT_ID),),
+            "UPDATE users SET stored_audio_bytes = ? WHERE id = ?",
+            (len(FRAME) - 1, str(ACCOUNT_ID)),
         )
     invariant = storage.storage_accounting_invariant(ACCOUNT_ID)
     assert not invariant.is_consistent
-    assert invariant.frame_stored_bytes == 5
+    assert invariant.frame_stored_bytes == len(FRAME)
 
 
 def test_project_release_accounting_primitive_is_transactional(tmp_path: Path) -> None:
@@ -298,7 +305,7 @@ def test_project_release_accounting_primitive_is_transactional(tmp_path: Path) -
         start_ms=0,
         end_ms=1,
         media_type="audio/webm;codecs=opus",
-        payload=b"released",
+        payload=FRAME,
     )
     with sqlite3.connect(path) as connection:
         connection.execute("BEGIN IMMEDIATE")

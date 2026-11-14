@@ -115,7 +115,7 @@ def test_compose_migrates_serves_controls_and_restarts() -> None:
         identity = compose("exec", "-T", "api", "id", "-u")
         base_url = api_base_url()
 
-        assert last_json_event(migrated.stdout)["schema_version"] == 5
+        assert last_json_event(migrated.stdout)["schema_version"] == 6
         assert identity.stdout.strip() == "1000"
         assert wait_for(f"{base_url}/health/live") == {"status": "ok"}
         assert wait_for(f"{base_url}/health/ready") == {"status": "ok"}

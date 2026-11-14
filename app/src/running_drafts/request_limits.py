@@ -13,6 +13,10 @@ class UploadConcurrencyLimitExceeded(Exception):
     pass
 
 
+class PlaybackConcurrencyLimitExceeded(Exception):
+    pass
+
+
 class TokenBucket:
     def __init__(
         self,
@@ -108,6 +112,48 @@ class UploadCapacity:
             self._process_active += 1
             self._account_active[account_id] = account_active + 1
         return UploadLease(self, account_id)
+
+    def release(self, account_id: UUID) -> None:
+        with self._lock:
+            self._process_active -= 1
+            remaining = self._account_active[account_id] - 1
+            if remaining:
+                self._account_active[account_id] = remaining
+            else:
+                del self._account_active[account_id]
+
+
+@dataclass
+class PlaybackLease:
+    capacity: PlaybackCapacity
+    account_id: UUID
+    released: bool = False
+
+    def release(self) -> None:
+        if self.released:
+            return
+        self.released = True
+        self.capacity.release(self.account_id)
+
+
+class PlaybackCapacity:
+    def __init__(self, *, per_account: int, process: int) -> None:
+        self._per_account = per_account
+        self._process_maximum = process
+        self._process_active = 0
+        self._account_active: dict[UUID, int] = {}
+        self._lock = threading.Lock()
+
+    def acquire(self, account_id: UUID) -> PlaybackLease:
+        with self._lock:
+            account_active = self._account_active.get(account_id, 0)
+            if account_active >= self._per_account:
+                raise PlaybackConcurrencyLimitExceeded("account")
+            if self._process_active >= self._process_maximum:
+                raise PlaybackConcurrencyLimitExceeded("process")
+            self._process_active += 1
+            self._account_active[account_id] = account_active + 1
+        return PlaybackLease(self, account_id)
 
     def release(self, account_id: UUID) -> None:
         with self._lock:

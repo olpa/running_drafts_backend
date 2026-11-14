@@ -60,6 +60,18 @@ class Settings(DatabaseSettings):
         ge=0,
         validation_alias="MAX_STAGED_DOWNLOAD_FILES",
     )
+    max_playback_response_bytes: int = Field(
+        gt=0,
+        validation_alias="MAX_PLAYBACK_RESPONSE_BYTES",
+    )
+    max_account_concurrent_playback_responses: int = Field(
+        gt=0,
+        validation_alias="MAX_ACCOUNT_CONCURRENT_PLAYBACK_RESPONSES",
+    )
+    max_process_concurrent_playback_responses: int = Field(
+        gt=0,
+        validation_alias="MAX_PROCESS_CONCURRENT_PLAYBACK_RESPONSES",
+    )
     account_requests_per_minute: int = Field(ge=0, validation_alias="ACCOUNT_REQUESTS_PER_MINUTE")
     account_request_burst: int = Field(ge=0, validation_alias="ACCOUNT_REQUEST_BURST")
     process_requests_per_minute: int = Field(ge=0, validation_alias="PROCESS_REQUESTS_PER_MINUTE")

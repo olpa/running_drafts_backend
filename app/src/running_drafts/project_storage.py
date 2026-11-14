@@ -22,10 +22,23 @@ from running_drafts.database import (
     is_busy_error,
 )
 from running_drafts.filesystem_capacity import StorageReserveUnavailable, require_capacity
+from running_drafts.playback_index import (
+    PlaybackIndexInvariant,
+    index_accepted_frame,
+    next_snapshot_etag,
+    state_from_row,
+    zero_snapshot_etag,
+)
+from running_drafts.playback_resource import (
+    PlaybackSnapshot,
+    iter_snapshot_range,
+    snapshot_length,
+)
 from running_drafts.storage_accounting import (
     StorageAccountingInvariant,
     calculate_storage_accounting_invariant,
 )
+from running_drafts.webm_playback import InvalidWebM, TrackMismatch
 
 CANONICAL_MEDIA_TYPE = "audio/webm;codecs=opus"
 SealReason = Literal["completed", "interrupted"]
@@ -90,6 +103,26 @@ class TemporaryFileFailure(RuntimeError):
 
 class FrameConflict(Exception):
     pass
+
+
+class InvalidAudioFrame(Exception):
+    pass
+
+
+class AudioTrackMismatch(Exception):
+    pass
+
+
+class PlaybackSnapshotNotAvailable(Exception):
+    def __init__(self, current_frame_count: int) -> None:
+        self.current_frame_count = current_frame_count
+
+
+class PlaybackRepresentationCorrupt(Exception):
+    def __init__(self, audio_asset_id: UUID, frame_count: int) -> None:
+        super().__init__("playback representation is corrupt")
+        self.audio_asset_id = audio_asset_id
+        self.frame_count = frame_count
 
 
 class AccountSuspended(Exception):
@@ -558,9 +591,7 @@ class ProjectStorage:
             row = connection.execute(
                 """
                 SELECT
-                    audio_assets.is_sealed,
-                    audio_assets.next_expected_sequence,
-                    audio_assets.observed_duration_ms,
+                    audio_assets.*,
                     projects.id AS project_id,
                     projects.created_at_ms,
                     users.suspended_at_ms
@@ -622,8 +653,8 @@ class ProjectStorage:
                 """
                 INSERT INTO transport_frames (
                     audio_asset_id, sequence, start_ms, end_ms,
-                    media_type, sha256, payload
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    media_type, sha256, payload, source_start, playback_etag
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(audio_asset_id),
@@ -633,8 +664,41 @@ class ProjectStorage:
                     media_type,
                     frame_sha256,
                     payload,
+                    row["stored_bytes"],
+                    next_snapshot_etag(
+                        str(audio_asset_id),
+                        sequence,
+                        frame_sha256,
+                        (
+                            None
+                            if sequence == 0
+                            else connection.execute(
+                                """
+                                SELECT playback_etag
+                                FROM transport_frames
+                                WHERE audio_asset_id = ? AND sequence = ?
+                                """,
+                                (str(audio_asset_id), sequence - 1),
+                            ).fetchone()["playback_etag"]
+                        ),
+                    ),
                 ),
             )
+            try:
+                index_accepted_frame(
+                    connection,
+                    audio_asset_id=str(audio_asset_id),
+                    sequence=sequence,
+                    frame_start=row["stored_bytes"],
+                    payload=payload,
+                    asset=row,
+                )
+            except TrackMismatch:
+                raise AudioTrackMismatch from None
+            except InvalidWebM:
+                raise InvalidAudioFrame from None
+            except PlaybackIndexInvariant as error:
+                raise DatabaseUnavailable from error
             next_expected_sequence += 1
             connection.execute(
                 """
@@ -894,6 +958,122 @@ class ProjectStorage:
             seal_reason=asset["seal_reason"],
             content_length=content_length,
         )
+
+    def latest_playback_frame_count(self, owner_id: UUID, audio_asset_id: UUID) -> int:
+        with self._connection() as connection:
+            self._assert_account_active(connection, owner_id)
+            row = connection.execute(
+                """
+                SELECT audio_assets.next_expected_sequence
+                FROM audio_assets
+                JOIN sections ON sections.id = audio_assets.section_id
+                JOIN projects ON projects.id = sections.project_id
+                WHERE audio_assets.id = ? AND projects.owner_id = ?
+                """,
+                (str(audio_asset_id), str(owner_id)),
+            ).fetchone()
+            if row is None:
+                raise ResourceNotFound
+            return row["next_expected_sequence"]
+
+    def playback_snapshot(
+        self,
+        owner_id: UUID,
+        audio_asset_id: UUID,
+        frame_count: int,
+    ) -> PlaybackSnapshot:
+        empty_bytes = files("running_drafts").joinpath("assets/empty-audio.webm").read_bytes()
+        with self._connection() as connection:
+            self._assert_account_active(connection, owner_id)
+            asset = connection.execute(
+                """
+                SELECT audio_assets.*
+                FROM audio_assets
+                JOIN sections ON sections.id = audio_assets.section_id
+                JOIN projects ON projects.id = sections.project_id
+                WHERE audio_assets.id = ? AND projects.owner_id = ?
+                """,
+                (str(audio_asset_id), str(owner_id)),
+            ).fetchone()
+            if asset is None:
+                raise ResourceNotFound
+            current_count = asset["next_expected_sequence"]
+            if frame_count > current_count:
+                raise PlaybackSnapshotNotAvailable(current_count)
+
+            if frame_count == 0:
+                digest = zero_snapshot_etag(str(audio_asset_id))
+            else:
+                frame = connection.execute(
+                    """
+                    SELECT playback_etag
+                    FROM transport_frames
+                    WHERE audio_asset_id = ? AND sequence = ?
+                    """,
+                    (str(audio_asset_id), frame_count - 1),
+                ).fetchone()
+                if frame is None or frame["playback_etag"] is None:
+                    raise PlaybackRepresentationCorrupt(audio_asset_id, frame_count)
+                digest = frame["playback_etag"]
+
+            last_cluster = connection.execute(
+                """
+                SELECT cluster_index, cumulative_bytes
+                FROM playback_clusters
+                WHERE audio_asset_id = ? AND completed_sequence < ?
+                ORDER BY completed_sequence DESC, cluster_index DESC
+                LIMIT 1
+                """,
+                (str(audio_asset_id), frame_count),
+            ).fetchone()
+            last_packet = connection.execute(
+                """
+                SELECT start_samples + duration_samples AS duration_samples
+                FROM playback_packets
+                WHERE audio_asset_id = ? AND completed_sequence < ?
+                ORDER BY completed_sequence DESC, packet_index DESC
+                LIMIT 1
+                """,
+                (str(audio_asset_id), frame_count),
+            ).fetchone()
+            cluster_count = 0 if last_cluster is None else last_cluster["cluster_index"] + 1
+            cluster_bytes = 0 if last_cluster is None else last_cluster["cumulative_bytes"]
+            duration_samples = 0 if last_packet is None else last_packet["duration_samples"]
+            track = state_from_row(asset).track if cluster_count else None
+            total_length = snapshot_length(
+                track,
+                duration_samples,
+                cluster_count,
+                cluster_bytes,
+                empty_bytes,
+            )
+            return PlaybackSnapshot(
+                audio_asset_id=str(audio_asset_id),
+                frame_count=frame_count,
+                etag=f'"playback-v1-{digest}"',
+                total_length=total_length,
+                duration_samples=duration_samples,
+                cluster_count=cluster_count,
+                cluster_bytes=cluster_bytes,
+                track=track,
+                empty_bytes=empty_bytes if cluster_count == 0 else None,
+            )
+
+    def playback_range(
+        self,
+        snapshot: PlaybackSnapshot,
+        start: int,
+        end: int,
+    ) -> Iterator[bytes]:
+        try:
+            with self._connection() as connection:
+                yield from iter_snapshot_range(connection, snapshot, start, end)
+        except PlaybackRepresentationCorrupt:
+            raise
+        except (RuntimeError, ValueError) as error:
+            raise PlaybackRepresentationCorrupt(
+                UUID(snapshot.audio_asset_id), snapshot.frame_count
+            ) from error
 
 
 def _project_summary(row: sqlite3.Row) -> ProjectSummary:
