@@ -20,6 +20,7 @@ MigrationAction = Callable[[sqlite3.Connection], None]
 class Migration:
     version: int
     apply: MigrationAction
+    rebuilds_referenced_tables: bool = False
 
 
 def _execute_sql_resource(filename: str) -> MigrationAction:
@@ -109,6 +110,11 @@ MIGRATIONS = (
     Migration(4, _execute_sql_resource("0004_remove_basic_auth.sql")),
     Migration(5, _execute_sql_resource("0005_plans_allowances.sql")),
     Migration(6, _apply_playback_index),
+    Migration(
+        7,
+        _execute_sql_resource("0007_audio_asset_lifecycle.sql"),
+        rebuilds_referenced_tables=True,
+    ),
 )
 MIGRATION_HEAD = MIGRATIONS[-1].version
 
@@ -146,14 +152,26 @@ def migrate(settings: DatabaseSettings) -> int:
         for migration in MIGRATIONS:
             if migration.version <= current:
                 continue
+            if migration.rebuilds_referenced_tables:
+                connection.execute("PRAGMA foreign_keys = OFF")
             connection.execute("BEGIN IMMEDIATE")
             try:
                 migration.apply(connection)
+                if migration.rebuilds_referenced_tables:
+                    foreign_key_failure = connection.execute("PRAGMA foreign_key_check").fetchone()
+                    if foreign_key_failure is not None:
+                        raise MigrationError(
+                            "foreign-key integrity check failed after table rebuild: "
+                            f"{foreign_key_failure!r}"
+                        )
                 connection.execute(f"PRAGMA user_version = {migration.version}")
                 connection.commit()
             except BaseException:
                 connection.rollback()
                 raise
+            finally:
+                if migration.rebuilds_referenced_tables:
+                    connection.execute("PRAGMA foreign_keys = ON")
         return MIGRATION_HEAD
     finally:
         connection.close()

@@ -17,8 +17,8 @@ FROM python:3.15.0-slim AS runtime
 RUN groupadd --gid 1000 running-drafts \
     && useradd --uid 1000 --gid running-drafts --no-create-home \
         --home-dir /app --shell /usr/sbin/nologin running-drafts \
-    && mkdir /data \
-    && chown running-drafts:running-drafts /data
+    && mkdir /data /staging \
+    && chown running-drafts:running-drafts /data /staging
 WORKDIR /app
 COPY --from=builder --chown=running-drafts:running-drafts /app/.venv /app/.venv
 ENV PATH="/app/.venv/bin:$PATH" \

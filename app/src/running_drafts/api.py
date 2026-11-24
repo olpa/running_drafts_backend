@@ -35,9 +35,11 @@ from running_drafts.project_api import router as project_router
 from running_drafts.project_storage import (
     AccountSuspended,
     AudioAssemblyFailure,
+    AudioAssetChanged,
     AudioAssetDurationLimitExceeded,
     AudioAssetNotSealed,
     AudioAssetSealConflict,
+    AudioAssetSealed,
     AudioStorageLimitExceeded,
     AudioTrackMismatch,
     DownloadStorageUnavailable,
@@ -228,6 +230,32 @@ def create_app(
             title="Audio asset seal conflict",
             detail="The audio asset cannot be sealed with this command.",
             code="audio_asset_seal_conflict",
+        )
+
+    @app.exception_handler(AudioAssetChanged)
+    def handle_audio_asset_changed(
+        _request: Request,
+        error: AudioAssetChanged,
+    ) -> JSONResponse:
+        return problem_response(
+            status=409,
+            title="Audio asset changed",
+            detail="The Audio Asset's accepted frame count no longer matches this confirmation.",
+            code="audio_asset_changed",
+            extensions={"currentFrameCount": error.current_frame_count},
+        )
+
+    @app.exception_handler(AudioAssetSealed)
+    def handle_audio_asset_sealed(
+        _request: Request,
+        error: AudioAssetSealed,
+    ) -> JSONResponse:
+        return problem_response(
+            status=409,
+            title="Audio asset sealed",
+            detail="The Audio Asset is sealed and cannot accept this command.",
+            code="audio_asset_sealed",
+            extensions={"sealReason": error.seal_reason},
         )
 
     @app.exception_handler(InvalidAudioFrame)

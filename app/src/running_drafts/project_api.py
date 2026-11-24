@@ -154,8 +154,9 @@ class AudioAssetSummaryResponse(CamelCaseResponse):
     id: UUID
     media_type: str
     is_sealed: bool
-    seal_reason: Literal["completed", "interrupted"] | None
-    sealed_at: datetime | None
+    seal_reason: Literal["completed", "interrupted", "user_resolved"] | None
+    created_at: datetime
+    updated_at: datetime
     frame_count: int
     observed_duration_ms: int
     stored_bytes: int
@@ -172,6 +173,7 @@ class DocumentResponse(CamelCaseResponse):
 
 
 class ProjectDetailResponse(ProjectSummaryResponse):
+    server_time: datetime
     document: DocumentResponse
 
 
@@ -183,6 +185,7 @@ class CreateSectionResponse(CamelCaseResponse):
     section_id: UUID
     audio_asset_id: UUID
     position: int
+    audio_asset: AudioAssetSummaryResponse
 
 
 class FrameAcknowledgementResponse(CamelCaseResponse):
@@ -231,12 +234,17 @@ def _project_response(project: ProjectSummary) -> ProjectSummaryResponse:
 
 
 def _audio_asset_response(asset: AudioAssetSummary) -> AudioAssetSummaryResponse:
+    created_at = _datetime(asset.created_at_ms)
+    updated_at = _datetime(asset.updated_at_ms)
+    assert created_at is not None
+    assert updated_at is not None
     return AudioAssetSummaryResponse(
         id=asset.id,
         media_type=asset.media_type,
         is_sealed=asset.is_sealed,
         seal_reason=asset.seal_reason,
-        sealed_at=_datetime(asset.sealed_at_ms),
+        created_at=created_at,
+        updated_at=updated_at,
         frame_count=asset.frame_count,
         observed_duration_ms=asset.observed_duration_ms,
         stored_bytes=asset.stored_bytes,
@@ -245,8 +253,11 @@ def _audio_asset_response(asset: AudioAssetSummary) -> AudioAssetSummaryResponse
 
 def _project_detail_response(detail: ProjectDetail) -> ProjectDetailResponse:
     project = _project_response(detail.project)
+    server_time = _datetime(detail.server_time_ms)
+    assert server_time is not None
     return ProjectDetailResponse(
         **project.model_dump(),
+        server_time=server_time,
         document=DocumentResponse(
             sections=[
                 SectionSummaryResponse(
@@ -265,6 +276,7 @@ def _section_creation_response(section: SectionCreation) -> CreateSectionRespons
         section_id=section.section_id,
         audio_asset_id=section.audio_asset_id,
         position=section.position,
+        audio_asset=_audio_asset_response(section.audio_asset),
     )
 
 
@@ -283,10 +295,7 @@ def _frame_problem(status_code: int, title: str, detail: str, code: str) -> Prob
 
 
 def _download_suffix(download: StagedAudioDownload) -> str:
-    suffix = f"-section-{download.section_position + 1}"
-    if download.seal_reason == "interrupted":
-        suffix += "-interrupted"
-    return f"{suffix}.webm"
+    return f"-section-{download.section_position + 1}.webm"
 
 
 def _download_filename(download: StagedAudioDownload) -> str:
@@ -707,6 +716,22 @@ def interrupt_audio_asset(
     storage: Storage,
 ) -> AudioAssetSummaryResponse:
     return _audio_asset_response(storage.interrupt_audio_asset(user_id, audio_asset_id))
+
+
+@router.post(
+    "/audio-assets/{audio_asset_id}/confirm-ended",
+    response_model=AudioAssetSummaryResponse,
+    responses=CONFLICT_RESPONSES,
+)
+def confirm_audio_asset_ended(
+    audio_asset_id: UUID4,
+    payload: CompleteAudioAssetRequest,
+    user_id: AuthenticatedUser,
+    storage: Storage,
+) -> AudioAssetSummaryResponse:
+    return _audio_asset_response(
+        storage.confirm_audio_asset_ended(user_id, audio_asset_id, payload.frame_count)
+    )
 
 
 @router.get(
