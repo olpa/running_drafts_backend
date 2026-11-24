@@ -41,7 +41,7 @@ from running_drafts.storage_accounting import (
 from running_drafts.webm_playback import InvalidWebM, TrackMismatch
 
 CANONICAL_MEDIA_TYPE = "audio/webm;codecs=opus"
-SealReason = Literal["completed", "interrupted"]
+SealReason = Literal["completed", "interrupted", "user_resolved"]
 _MEDIA_PARAMETER = re.compile(
     r"^([!#$%&'*+.^_`|~0-9A-Za-z-]+)\s*=\s*(?:\"([^\"]*)\"|([^\s;]+))$"
 )
@@ -65,6 +65,16 @@ class IdempotencyKeyReused(Exception):
 
 class AudioAssetSealConflict(Exception):
     pass
+
+
+class AudioAssetChanged(Exception):
+    def __init__(self, current_frame_count: int) -> None:
+        self.current_frame_count = current_frame_count
+
+
+class AudioAssetSealed(Exception):
+    def __init__(self, seal_reason: SealReason) -> None:
+        self.seal_reason = seal_reason
 
 
 class AudioAssetNotSealed(Exception):
@@ -151,7 +161,8 @@ class AudioAssetSummary:
     media_type: str
     is_sealed: bool
     seal_reason: SealReason | None
-    sealed_at_ms: int | None
+    created_at_ms: int
+    updated_at_ms: int
     frame_count: int
     observed_duration_ms: int
     stored_bytes: int
@@ -168,6 +179,7 @@ class SectionSummary:
 class ProjectDetail:
     project: ProjectSummary
     sections: tuple[SectionSummary, ...]
+    server_time_ms: int
 
 
 @dataclass(frozen=True)
@@ -175,6 +187,7 @@ class SectionCreation:
     section_id: UUID
     audio_asset_id: UUID
     position: int
+    audio_asset: AudioAssetSummary
 
 
 @dataclass(frozen=True)
@@ -420,7 +433,8 @@ class ProjectStorage:
                     audio_assets.media_type,
                     audio_assets.is_sealed,
                     audio_assets.seal_reason,
-                    audio_assets.sealed_at_ms,
+                    audio_assets.created_at_ms,
+                    audio_assets.updated_at_ms,
                     audio_assets.next_expected_sequence,
                     audio_assets.observed_duration_ms,
                     audio_assets.stored_bytes
@@ -439,7 +453,7 @@ class ProjectStorage:
             )
             for row in rows
         )
-        return ProjectDetail(_project_summary(project), sections)
+        return ProjectDetail(_project_summary(project), sections, self._clock_ms())
 
     def rename_project(
         self,
@@ -485,7 +499,10 @@ class ProjectStorage:
         with self._transaction() as connection:
             self._assert_account_active(connection, owner_id)
             project = connection.execute(
-                "SELECT created_at_ms FROM projects WHERE id = ? AND owner_id = ?",
+                """
+                SELECT created_at_ms, updated_at_ms
+                FROM projects WHERE id = ? AND owner_id = ?
+                """,
                 (str(project_id), str(owner_id)),
             ).fetchone()
             if project is None:
@@ -496,7 +513,15 @@ class ProjectStorage:
                     sections.id AS section_id,
                     sections.position,
                     sections.creation_media_type,
-                    audio_assets.id AS audio_asset_id
+                    audio_assets.id AS audio_asset_id,
+                    audio_assets.media_type,
+                    audio_assets.is_sealed,
+                    audio_assets.seal_reason,
+                    audio_assets.created_at_ms,
+                    audio_assets.updated_at_ms,
+                    audio_assets.next_expected_sequence,
+                    audio_assets.observed_duration_ms,
+                    audio_assets.stored_bytes
                 FROM sections
                 JOIN audio_assets ON audio_assets.section_id = sections.id
                 WHERE sections.project_id = ? AND sections.creation_key = ?
@@ -511,6 +536,7 @@ class ProjectStorage:
                         section_id=UUID(existing["section_id"]),
                         audio_asset_id=UUID(existing["audio_asset_id"]),
                         position=existing["position"],
+                        audio_asset=_audio_asset_summary(existing),
                     ),
                     created=False,
                 )
@@ -521,6 +547,7 @@ class ProjectStorage:
             ).fetchone()[0]
             section_id = self._new_id()
             audio_asset_id = self._new_id()
+            created_at_ms = max(self._clock_ms(), project["updated_at_ms"])
             connection.execute(
                 """
                 INSERT INTO sections (
@@ -536,16 +563,36 @@ class ProjectStorage:
                 ),
             )
             connection.execute(
-                "INSERT INTO audio_assets (id, section_id, media_type) VALUES (?, ?, ?)",
-                (str(audio_asset_id), str(section_id), media_type),
+                """
+                INSERT INTO audio_assets (
+                    id, section_id, media_type, created_at_ms, updated_at_ms
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    str(audio_asset_id),
+                    str(section_id),
+                    media_type,
+                    created_at_ms,
+                    created_at_ms,
+                ),
             )
-            updated_at_ms = max(self._clock_ms(), project["created_at_ms"])
             connection.execute(
                 "UPDATE projects SET updated_at_ms = ? WHERE id = ?",
-                (updated_at_ms, str(project_id)),
+                (created_at_ms, str(project_id)),
+            )
+            audio_asset = AudioAssetSummary(
+                id=audio_asset_id,
+                media_type=media_type,
+                is_sealed=False,
+                seal_reason=None,
+                created_at_ms=created_at_ms,
+                updated_at_ms=created_at_ms,
+                frame_count=0,
+                observed_duration_ms=0,
+                stored_bytes=0,
             )
             return CreationResult(
-                SectionCreation(section_id, audio_asset_id, position),
+                SectionCreation(section_id, audio_asset_id, position, audio_asset),
                 created=True,
             )
 
@@ -574,6 +621,19 @@ class ProjectStorage:
             frame_count=None,
         )
 
+    def confirm_audio_asset_ended(
+        self,
+        owner_id: UUID,
+        audio_asset_id: UUID,
+        frame_count: int,
+    ) -> AudioAssetSummary:
+        return self._seal_audio_asset(
+            owner_id,
+            audio_asset_id,
+            reason="user_resolved",
+            frame_count=frame_count,
+        )
+
     def accept_audio_frame(
         self,
         owner_id: UUID,
@@ -593,7 +653,7 @@ class ProjectStorage:
                 SELECT
                     audio_assets.*,
                     projects.id AS project_id,
-                    projects.created_at_ms,
+                    projects.updated_at_ms AS project_updated_at_ms,
                     users.suspended_at_ms
                 FROM audio_assets
                 JOIN sections ON sections.id = audio_assets.section_id
@@ -630,7 +690,9 @@ class ProjectStorage:
                     sha256=frame_sha256,
                     next_expected_sequence=next_expected_sequence,
                 )
-            if row["is_sealed"] or sequence > next_expected_sequence:
+            if row["is_sealed"]:
+                raise AudioAssetSealed(row["seal_reason"])
+            if sequence > next_expected_sequence:
                 raise FrameConflict
             if start_ms != row["observed_duration_ms"]:
                 raise FrameConflict
@@ -700,24 +762,35 @@ class ProjectStorage:
             except PlaybackIndexInvariant as error:
                 raise DatabaseUnavailable from error
             next_expected_sequence += 1
+            accepted_at_ms = max(
+                self._clock_ms(),
+                row["updated_at_ms"],
+                row["project_updated_at_ms"],
+            )
             connection.execute(
                 """
                 UPDATE audio_assets
                 SET next_expected_sequence = ?,
                     observed_duration_ms = ?,
-                    stored_bytes = stored_bytes + ?
+                    stored_bytes = stored_bytes + ?,
+                    updated_at_ms = ?
                 WHERE id = ?
                 """,
-                (next_expected_sequence, end_ms, len(payload), str(audio_asset_id)),
+                (
+                    next_expected_sequence,
+                    end_ms,
+                    len(payload),
+                    accepted_at_ms,
+                    str(audio_asset_id),
+                ),
             )
             connection.execute(
                 "UPDATE users SET stored_audio_bytes = stored_audio_bytes + ? WHERE id = ?",
                 (len(payload), str(owner_id)),
             )
-            updated_at_ms = max(self._clock_ms(), row["created_at_ms"])
             connection.execute(
                 "UPDATE projects SET updated_at_ms = ? WHERE id = ?",
-                (updated_at_ms, row["project_id"]),
+                (accepted_at_ms, row["project_id"]),
             )
             return FrameAcknowledgement(
                 sequence=sequence,
@@ -742,12 +815,13 @@ class ProjectStorage:
                     audio_assets.media_type,
                     audio_assets.is_sealed,
                     audio_assets.seal_reason,
-                    audio_assets.sealed_at_ms,
+                    audio_assets.created_at_ms,
+                    audio_assets.updated_at_ms,
                     audio_assets.next_expected_sequence,
                     audio_assets.observed_duration_ms,
                     audio_assets.stored_bytes,
                     projects.id AS project_id,
-                    projects.created_at_ms
+                    projects.updated_at_ms AS project_updated_at_ms
                 FROM audio_assets
                 JOIN sections ON sections.id = audio_assets.section_id
                 JOIN projects ON projects.id = sections.project_id
@@ -758,28 +832,33 @@ class ProjectStorage:
             if row is None:
                 raise ResourceNotFound
             if row["is_sealed"]:
-                same_completion = (
-                    reason == "completed"
-                    and row["seal_reason"] == "completed"
+                same_counted_reason = (
+                    reason in {"completed", "user_resolved"}
+                    and row["seal_reason"] == reason
                     and frame_count == row["next_expected_sequence"]
                 )
                 same_interruption = reason == "interrupted" and row["seal_reason"] == "interrupted"
-                if same_completion or same_interruption:
+                if same_counted_reason or same_interruption:
                     return _audio_asset_summary(row)
-                raise AudioAssetSealConflict
-            if reason == "completed" and frame_count != row["next_expected_sequence"]:
+                raise AudioAssetSealed(row["seal_reason"])
+            if frame_count is not None and frame_count != row["next_expected_sequence"]:
+                if reason == "user_resolved":
+                    raise AudioAssetChanged(row["next_expected_sequence"])
                 raise AudioAssetSealConflict
 
-            sealed_at_ms = self._clock_ms()
+            updated_at_ms = max(
+                self._clock_ms(),
+                row["updated_at_ms"],
+                row["project_updated_at_ms"],
+            )
             connection.execute(
                 """
                 UPDATE audio_assets
-                SET is_sealed = 1, seal_reason = ?, sealed_at_ms = ?
+                SET is_sealed = 1, seal_reason = ?, updated_at_ms = ?
                 WHERE id = ?
                 """,
-                (reason, sealed_at_ms, str(audio_asset_id)),
+                (reason, updated_at_ms, str(audio_asset_id)),
             )
-            updated_at_ms = max(sealed_at_ms, row["created_at_ms"])
             connection.execute(
                 "UPDATE projects SET updated_at_ms = ? WHERE id = ?",
                 (updated_at_ms, row["project_id"]),
@@ -789,7 +868,8 @@ class ProjectStorage:
                 media_type=row["media_type"],
                 is_sealed=True,
                 seal_reason=reason,
-                sealed_at_ms=sealed_at_ms,
+                created_at_ms=row["created_at_ms"],
+                updated_at_ms=updated_at_ms,
                 frame_count=row["next_expected_sequence"],
                 observed_duration_ms=row["observed_duration_ms"],
                 stored_bytes=row["stored_bytes"],
@@ -1091,7 +1171,8 @@ def _audio_asset_summary(row: sqlite3.Row) -> AudioAssetSummary:
         media_type=row["media_type"],
         is_sealed=bool(row["is_sealed"]),
         seal_reason=row["seal_reason"],
-        sealed_at_ms=row["sealed_at_ms"],
+        created_at_ms=row["created_at_ms"],
+        updated_at_ms=row["updated_at_ms"],
         frame_count=row["next_expected_sequence"],
         observed_duration_ms=row["observed_duration_ms"],
         stored_bytes=row["stored_bytes"],

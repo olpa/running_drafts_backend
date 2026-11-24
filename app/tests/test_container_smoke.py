@@ -115,9 +115,15 @@ def test_compose_migrates_serves_controls_and_restarts() -> None:
         identity = compose("exec", "-T", "api", "id", "-u")
         base_url = api_base_url()
 
-        assert last_json_event(migrated.stdout)["schema_version"] == 6
+        assert last_json_event(migrated.stdout)["schema_version"] == 7
         assert identity.stdout.strip() == "1000"
-        assert wait_for(f"{base_url}/health/live") == {"status": "ok"}
+        try:
+            assert wait_for(f"{base_url}/health/live") == {"status": "ok"}
+        except AssertionError as error:
+            logs = compose("logs", "api", check=False)
+            raise AssertionError(
+                f"API failed to become live\nstdout:\n{logs.stdout}\nstderr:\n{logs.stderr}"
+            ) from error
         assert wait_for(f"{base_url}/health/ready") == {"status": "ok"}
         headers = control_headers(base_url)
         assert request_json(

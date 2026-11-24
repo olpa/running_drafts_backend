@@ -277,20 +277,22 @@ def test_section_creation_is_canonical_idempotent_and_visible_in_document(
     assert replay_body == first_body
     assert unsupported.status_code == 422, unsupported_body
     section = detail.json()["document"]["sections"][0]
-    assert section == {
-        "id": first_body["sectionId"],
-        "position": 0,
-        "audioAsset": {
-            "id": first_body["audioAssetId"],
-            "mediaType": "audio/webm;codecs=opus",
-            "isSealed": False,
-            "sealReason": None,
-            "sealedAt": None,
-            "frameCount": 0,
-            "observedDurationMs": 0,
-            "storedBytes": 0,
-        },
+    assert section["id"] == first_body["sectionId"]
+    assert section["position"] == 0
+    assert first_body["audioAsset"] == section["audioAsset"]
+    assert section["audioAsset"] == {
+        "id": first_body["audioAssetId"],
+        "mediaType": "audio/webm;codecs=opus",
+        "isSealed": False,
+        "sealReason": None,
+        "createdAt": section["audioAsset"]["createdAt"],
+        "updatedAt": section["audioAsset"]["createdAt"],
+        "frameCount": 0,
+        "observedDurationMs": 0,
+        "storedBytes": 0,
     }
+    assert "sealedAt" not in section["audioAsset"]
+    assert detail.json()["serverTime"] >= section["audioAsset"]["updatedAt"]
 
 
 def test_audio_frame_upload_is_acknowledged_and_visible_in_project_detail(
@@ -313,6 +315,23 @@ def test_audio_frame_upload_is_acknowledged_and_visible_in_project_detail(
     assert asset["frameCount"] == 1
     assert asset["observedDurationMs"] == 1_000
     assert asset["storedBytes"] == len(DEFAULT_FRAME_PAYLOADS[0])
+
+
+def test_section_creation_replay_returns_latest_audio_asset_summary(
+    client: TestClient,
+) -> None:
+    project = create_project(client)
+    key = uuid4()
+    created, _response = create_section(client, project["id"], key=key)
+    assert upload_frame(client, created["audioAssetId"], 0).status_code == 200
+
+    replay, response = create_section(client, project["id"], key=key)
+
+    assert response.status_code == 201
+    assert response.headers["location"] == f"/api/v1/projects/{project['id']}"
+    assert replay["sectionId"] == created["sectionId"]
+    assert replay["audioAsset"]["frameCount"] == 1
+    assert replay["audioAsset"]["updatedAt"] >= replay["audioAsset"]["createdAt"]
 
 
 def test_audio_frame_upload_enforces_body_media_and_timing_rules(
@@ -429,12 +448,15 @@ def test_audio_frame_http_replays_and_conflicts_follow_asset_state(
     assert second.status_code == 200
     assert replay.status_code == 200
     assert replay.json()["nextExpectedSequence"] == 2
-    for conflict in (gap, discontinuity, changed_replay, new_after_seal):
+    for conflict in (gap, discontinuity, changed_replay):
         assert conflict.status_code == 409
         assert conflict.json()["code"] == "frame_conflict"
     assert sealed.status_code == 200
     assert replay_after_seal.status_code == 200
     assert replay_after_seal.json()["nextExpectedSequence"] == 2
+    assert new_after_seal.status_code == 409
+    assert new_after_seal.json()["code"] == "audio_asset_sealed"
+    assert new_after_seal.json()["sealReason"] == "completed"
 
 
 def test_invalid_and_mismatched_audio_frames_roll_back_before_acknowledgement(
@@ -499,6 +521,11 @@ def test_cross_user_access_is_privacy_preserving(client: TestClient) -> None:
             f"/api/v1/audio-assets/{section['audioAssetId']}/interrupt",
             headers=auth("Bob"),
         ),
+        client.post(
+            f"/api/v1/audio-assets/{section['audioAssetId']}/confirm-ended",
+            json={"frameCount": 0},
+            headers=auth("Bob"),
+        ),
         upload_frame(
             client,
             section["audioAssetId"],
@@ -520,6 +547,12 @@ def test_zero_frame_sealing_is_idempotent_and_conflicts_are_stable(
     project = create_project(client)
     completed_section, _response = create_section(client, project["id"])
     asset_id = completed_section["audioAssetId"]
+
+    open_changed_count = client.post(
+        f"/api/v1/audio-assets/{asset_id}/complete",
+        json={"frameCount": 1},
+        headers=auth(),
+    )
 
     completed = client.post(
         f"/api/v1/audio-assets/{asset_id}/complete",
@@ -552,6 +585,8 @@ def test_zero_frame_sealing_is_idempotent_and_conflicts_are_stable(
     )
 
     assert completed.status_code == 200
+    assert open_changed_count.status_code == 409
+    assert open_changed_count.json()["code"] == "audio_asset_seal_conflict"
     assert completed.json()["isSealed"] is True
     assert completed.json()["sealReason"] == "completed"
     assert completed.json()["frameCount"] == 0
@@ -559,9 +594,88 @@ def test_zero_frame_sealing_is_idempotent_and_conflicts_are_stable(
     assert replay.json() == completed.json()
     for conflict in (changed_count, opposite):
         assert conflict.status_code == 409
-        assert conflict.json()["code"] == "audio_asset_seal_conflict"
+        assert conflict.json()["code"] == "audio_asset_sealed"
+        assert conflict.json()["sealReason"] == "completed"
     assert interrupted.json()["sealReason"] == "interrupted"
     assert interrupted_replay.json() == interrupted.json()
+
+
+def test_confirmation_compares_frame_count_and_reports_terminal_state(
+    client: TestClient,
+) -> None:
+    project = create_project(client)
+    section, _response = create_section(client, project["id"])
+    endpoint = f"/api/v1/audio-assets/{section['audioAssetId']}/confirm-ended"
+
+    changed = client.post(endpoint, json={"frameCount": 1}, headers=auth())
+    confirmed = client.post(endpoint, json={"frameCount": 0}, headers=auth())
+    replay = client.post(endpoint, json={"frameCount": 0}, headers=auth())
+    stale_after_seal = client.post(endpoint, json={"frameCount": 1}, headers=auth())
+    late_complete = client.post(
+        f"/api/v1/audio-assets/{section['audioAssetId']}/complete",
+        json={"frameCount": 0},
+        headers=auth(),
+    )
+    late_interrupt = client.post(
+        f"/api/v1/audio-assets/{section['audioAssetId']}/interrupt",
+        headers=auth(),
+    )
+
+    assert changed.status_code == 409
+    assert changed.json()["code"] == "audio_asset_changed"
+    assert changed.json()["currentFrameCount"] == 0
+    assert confirmed.status_code == 200
+    assert confirmed.json()["isSealed"] is True
+    assert confirmed.json()["sealReason"] == "user_resolved"
+    assert "sealedAt" not in confirmed.json()
+    assert confirmed.json()["updatedAt"] >= confirmed.json()["createdAt"]
+    assert replay.json() == confirmed.json()
+    assert stale_after_seal.status_code == 409
+    assert stale_after_seal.json()["code"] == "audio_asset_sealed"
+    assert stale_after_seal.json()["sealReason"] == "user_resolved"
+    for response in (late_complete, late_interrupt):
+        assert response.status_code == 409
+        assert response.json()["code"] == "audio_asset_sealed"
+        assert response.json()["sealReason"] == "user_resolved"
+
+
+def test_confirmation_respects_suspension(database_path: Path, client: TestClient) -> None:
+    project = create_project(client)
+    section, _response = create_section(client, project["id"])
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "UPDATE users SET suspended_at_ms = 1 WHERE id = ?",
+            (str(user_id(database_path, "Alice")),),
+        )
+
+    response = client.post(
+        f"/api/v1/audio-assets/{section['audioAssetId']}/confirm-ended",
+        json={"frameCount": 0},
+        headers=auth(),
+    )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "account_suspended"
+
+
+def test_user_resolved_download_preserves_exact_audio_and_common_filename(
+    client: TestClient,
+) -> None:
+    project = create_project(client, title="Resolved Notes")
+    section, _response = create_section(client, project["id"])
+    asset_id = section["audioAssetId"]
+    assert upload_frame(client, asset_id, 0).status_code == 200
+    assert client.post(
+        f"/api/v1/audio-assets/{asset_id}/confirm-ended",
+        json={"frameCount": 1},
+        headers=auth(),
+    ).status_code == 200
+
+    downloaded = client.get(f"/api/v1/audio-assets/{asset_id}/download", headers=auth())
+
+    assert downloaded.status_code == 200
+    assert downloaded.content == DEFAULT_FRAME_PAYLOADS[0]
+    assert "Resolved-Notes-section-1.webm" in downloaded.headers["content-disposition"]
 
 
 def test_sealed_audio_download_returns_exact_ordered_frames(client: TestClient) -> None:
@@ -874,9 +988,9 @@ def test_download_filename_preserves_suffix_within_utf8_length_limit(
     encoded_name = downloaded.headers["content-disposition"].split("filename*=UTF-8''", 1)[1]
     filename = unquote(encoded_name)
     assert len(filename.encode()) <= 240
-    assert filename.endswith("-section-1-interrupted.webm")
+    assert filename.endswith("-section-1.webm")
     assert filename.startswith("界")
-    assert 'filename="download-section-1-interrupted.webm"' in downloaded.headers[
+    assert 'filename="download-section-1.webm"' in downloaded.headers[
         "content-disposition"
     ]
 
@@ -1296,8 +1410,7 @@ def test_real_browser_audio_download_is_the_exact_joined_stream(
 
     assert downloaded.status_code == 200
     assert downloaded.content == (fixture / "joined.webm").read_bytes()
-    expected_suffix = "-interrupted.webm" if case.endswith("interrupted") else ".webm"
-    assert f"section-1{expected_suffix}" in downloaded.headers["content-disposition"]
+    assert "section-1.webm" in downloaded.headers["content-disposition"]
 
 
 def test_completion_frame_count_requires_a_nonnegative_integer(client: TestClient) -> None:
@@ -1330,6 +1443,7 @@ def test_openapi_declares_routes_security_locations_and_problem_details(
         "/api/v1/audio-assets/{audio_asset_id}/frames/{sequence}",
         "/api/v1/audio-assets/{audio_asset_id}/complete",
         "/api/v1/audio-assets/{audio_asset_id}/interrupt",
+        "/api/v1/audio-assets/{audio_asset_id}/confirm-ended",
         "/api/v1/audio-assets/{audio_asset_id}/download",
         "/api/v1/audio-assets/{audio_asset_id}/playback/latest",
         "/api/v1/audio-assets/{audio_asset_id}/playback/snapshots/{frame_count}",
@@ -1343,6 +1457,14 @@ def test_openapi_declares_routes_security_locations_and_problem_details(
     assert "requestBody" not in paths[
         "/api/v1/audio-assets/{audio_asset_id}/interrupt"
     ]["post"]
+    assert "requestBody" in paths[
+        "/api/v1/audio-assets/{audio_asset_id}/confirm-ended"
+    ]["post"]
+    audio_asset_schema = schema["components"]["schemas"]["AudioAssetSummaryResponse"]
+    assert {"createdAt", "updatedAt", "isSealed", "sealReason"} <= set(
+        audio_asset_schema["properties"]
+    )
+    assert "sealedAt" not in audio_asset_schema["properties"]
     frame_operation = paths[
         "/api/v1/audio-assets/{audio_asset_id}/frames/{sequence}"
     ]["put"]

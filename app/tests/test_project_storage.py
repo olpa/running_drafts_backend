@@ -14,6 +14,8 @@ import pytest
 from running_drafts.database import existing_connection
 from running_drafts.project_storage import (
     AudioAssemblyFailure,
+    AudioAssetChanged,
+    AudioAssetSealed,
     FrameConflict,
     ProjectStorage,
     ResourceNotFound,
@@ -154,6 +156,61 @@ def test_state_survives_reopening_the_storage(tmp_path: Path) -> None:
     assert detail.sections[0].audio_asset.seal_reason == "completed"
 
 
+def test_section_creation_returns_monotonic_audio_asset_timestamps(tmp_path: Path) -> None:
+    database_path = migrated_database(tmp_path)
+    owner_id = user_id(database_path)
+    moments = iter([1_000, 900, 1_000])
+    store = storage(database_path, clock_ms=lambda: next(moments))
+    project = store.create_project(owner_id, uuid4(), "Timestamps").value
+
+    created = store.create_section(
+        owner_id,
+        project.id,
+        uuid4(),
+        "audio/webm;codecs=opus",
+    ).value
+
+    assert created.audio_asset.id == created.audio_asset_id
+    assert created.audio_asset.created_at_ms == 1_000
+    assert created.audio_asset.updated_at_ms == 1_000
+    assert created.audio_asset.is_sealed is False
+    assert created.audio_asset.seal_reason is None
+    detail = store.get_project(owner_id, project.id)
+    assert detail.project.updated_at_ms == 1_000
+    assert detail.sections[0].audio_asset == created.audio_asset
+
+
+def test_confirmation_compares_frame_count_and_is_idempotent(tmp_path: Path) -> None:
+    database_path = migrated_database(tmp_path)
+    owner_id = user_id(database_path)
+    moments = iter([1_000, 2_000, 1_500, 2_000])
+    store = storage(database_path, clock_ms=lambda: next(moments))
+    project = store.create_project(owner_id, uuid4(), "Confirmation").value
+    asset = store.create_section(
+        owner_id,
+        project.id,
+        uuid4(),
+        "audio/webm;codecs=opus",
+    ).value.audio_asset
+
+    with pytest.raises(AudioAssetChanged) as changed:
+        store.confirm_audio_asset_ended(owner_id, asset.id, 1)
+    assert changed.value.current_frame_count == 0
+
+    confirmed = store.confirm_audio_asset_ended(owner_id, asset.id, 0)
+    replay = store.confirm_audio_asset_ended(owner_id, asset.id, 0)
+
+    assert confirmed.is_sealed is True
+    assert confirmed.seal_reason == "user_resolved"
+    assert confirmed.created_at_ms == 2_000
+    assert confirmed.updated_at_ms == 2_000
+    assert replay == confirmed
+    assert store.get_project(owner_id, project.id).project.updated_at_ms == 2_000
+    with pytest.raises(AudioAssetSealed) as sealed:
+        store.confirm_audio_asset_ended(owner_id, asset.id, 1)
+    assert sealed.value.seal_reason == "user_resolved"
+
+
 def test_first_audio_frame_is_acknowledged_and_survives_restart(tmp_path: Path) -> None:
     database_path = migrated_database(tmp_path)
     owner_id = user_id(database_path)
@@ -184,6 +241,8 @@ def test_first_audio_frame_is_acknowledged_and_survives_restart(tmp_path: Path) 
     restarted_detail = restarted_store.get_project(owner_id, project.id)
     assert restarted_detail.project.updated_at_ms == 3_000
     assert restarted_detail.sections[0].audio_asset.frame_count == 1
+    assert restarted_detail.sections[0].audio_asset.created_at_ms == 2_000
+    assert restarted_detail.sections[0].audio_asset.updated_at_ms == 3_000
     assert restarted_detail.sections[0].audio_asset.observed_duration_ms == 1_000
     assert restarted_detail.sections[0].audio_asset.stored_bytes == len(FRAME_ZERO)
     replay = restarted_store.accept_audio_frame(
@@ -272,7 +331,7 @@ def test_audio_frame_replays_are_idempotent_and_return_the_current_cursor(
         payload=FRAME_ZERO,
     )
     assert sealed_replay.next_expected_sequence == 2
-    with pytest.raises(FrameConflict):
+    with pytest.raises(AudioAssetSealed) as sealed:
         store.accept_audio_frame(
             owner_id,
             asset_id,
@@ -282,6 +341,7 @@ def test_audio_frame_replays_are_idempotent_and_return_the_current_cursor(
             media_type="audio/webm;codecs=opus",
             payload=b"new-after-seal",
         )
+    assert sealed.value.seal_reason == "completed"
 
 
 def test_virtual_playback_matches_canonical_fixture_and_preserves_history(
@@ -500,8 +560,95 @@ def test_frame_and_seal_transactions_follow_database_order(tmp_path: Path) -> No
         )
         release_seal.set()
         assert sealing.result().seal_reason == "interrupted"
-        with pytest.raises(FrameConflict):
+        with pytest.raises(AudioAssetSealed) as sealed:
             accepting_after_seal.result()
+        assert sealed.value.seal_reason == "interrupted"
+
+
+def test_frame_and_confirmation_transactions_use_expected_count(tmp_path: Path) -> None:
+    database_path = migrated_database(tmp_path)
+    owner_id = user_id(database_path)
+    store = storage(database_path)
+    project = store.create_project(owner_id, uuid4(), "Confirmation races").value
+
+    frame_first = store.create_section(
+        owner_id,
+        project.id,
+        uuid4(),
+        "audio/webm;codecs=opus",
+    ).value
+    frame_has_lock = Event()
+    release_frame = Event()
+
+    def frame_clock() -> int:
+        frame_has_lock.set()
+        assert release_frame.wait(timeout=5)
+        return 3_000
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        accepting = executor.submit(
+            storage(database_path, clock_ms=frame_clock).accept_audio_frame,
+            owner_id,
+            frame_first.audio_asset_id,
+            sequence=0,
+            start_ms=0,
+            end_ms=1_000,
+            media_type="audio/webm;codecs=opus",
+            payload=FRAME_ZERO,
+        )
+        assert frame_has_lock.wait(timeout=5)
+        confirming = executor.submit(
+            store.confirm_audio_asset_ended,
+            owner_id,
+            frame_first.audio_asset_id,
+            0,
+        )
+        release_frame.set()
+        assert accepting.result().next_expected_sequence == 1
+        with pytest.raises(AudioAssetChanged) as changed:
+            confirming.result()
+    assert changed.value.current_frame_count == 1
+    frame_first_summary = store.get_project(owner_id, project.id).sections[0].audio_asset
+    assert frame_first_summary.is_sealed is False
+    assert frame_first_summary.frame_count == 1
+
+    confirmation_first = store.create_section(
+        owner_id,
+        project.id,
+        uuid4(),
+        "audio/webm;codecs=opus",
+    ).value
+    confirmation_has_lock = Event()
+    release_confirmation = Event()
+
+    def confirmation_clock() -> int:
+        confirmation_has_lock.set()
+        assert release_confirmation.wait(timeout=5)
+        return 4_000
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        confirming = executor.submit(
+            storage(database_path, clock_ms=confirmation_clock).confirm_audio_asset_ended,
+            owner_id,
+            confirmation_first.audio_asset_id,
+            0,
+        )
+        assert confirmation_has_lock.wait(timeout=5)
+        accepting = executor.submit(
+            store.accept_audio_frame,
+            owner_id,
+            confirmation_first.audio_asset_id,
+            sequence=0,
+            start_ms=0,
+            end_ms=1_000,
+            media_type="audio/webm;codecs=opus",
+            payload=FRAME_ZERO,
+        )
+        release_confirmation.set()
+        assert confirming.result().seal_reason == "user_resolved"
+        with pytest.raises(AudioAssetSealed) as sealed:
+            accepting.result()
+    assert sealed.value.seal_reason == "user_resolved"
 
 
 def test_overlapping_frame_writers_store_and_charge_once(tmp_path: Path) -> None:

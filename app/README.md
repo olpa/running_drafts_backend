@@ -137,6 +137,29 @@ suspend/reinstate commands. Mutations require an explicit Account UUID and
 reason and emit a structured success event. Suspension deletes existing
 Application Sessions without deleting Account data.
 
+## Unfinished Audio Assets
+
+An unsealed Audio Asset is durable unfinished audio, not proof that browser
+Capture is still active. Browser disappearance, inactivity, Project reads, and
+elapsed time never seal it automatically. Accepted frames remain accounted and
+available through immutable playback snapshots; exact-original download stays
+sealed-only.
+
+Audio Asset summaries expose required `createdAt`, `updatedAt`, `isSealed`, and
+nullable `sealReason`. A new accepted frame and first-time seal advance the
+asset's `updatedAt`; idempotent retries do not. Project detail also includes
+`serverTime` as response metadata so clients can compare server-authored
+activity evidence without relying on the browser clock.
+
+`POST /api/v1/audio-assets/{audio_asset_id}/confirm-ended` accepts a required
+`frameCount`. It atomically seals a matching open asset as `user_resolved`. If a
+new frame committed after the represented state, the command leaves the asset
+open and returns `409 audio_asset_changed` with `currentFrameCount`. Incompatible
+commands against a sealed asset return terminal `409 audio_asset_sealed` with
+the authoritative `sealReason`. Expected frame count is optimistic concurrency,
+not an inactivity policy; the API has no leases, heartbeats, or automatic
+resolution.
+
 ## Incremental playback
 
 Each accepted browser WebM/Opus frame updates a transactional playback index.
