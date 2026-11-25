@@ -27,6 +27,7 @@ from running_drafts.project_storage import (
     UnsupportedMediaType,
     canonicalize_media_type,
     normalize_title,
+    timestamp_to_rfc3339,
 )
 from running_drafts.request_limits import (
     PlaybackCapacity,
@@ -37,6 +38,8 @@ from running_drafts.request_limits import (
 from running_drafts.settings import Settings
 
 MAX_SQLITE_INTEGER = 2**63 - 1
+PROJECT_API_PREFIX = "/api/v1"
+AUDIO_ASSET_READ_PATH = "/audio-assets/{audio_asset_id}"
 
 
 class ConcurrentDownloadLimitExceeded(Exception):
@@ -160,6 +163,11 @@ class AudioAssetSummaryResponse(CamelCaseResponse):
     frame_count: int
     observed_duration_ms: int
     stored_bytes: int
+
+
+class AudioAssetReadResponse(CamelCaseResponse):
+    audio_asset: AudioAssetSummaryResponse
+    server_time: str = Field(json_schema_extra={"format": "date-time"})
 
 
 class SectionSummaryResponse(CamelCaseResponse):
@@ -429,6 +437,20 @@ COMMON_RESPONSES = {
 NOT_FOUND_RESPONSES = COMMON_RESPONSES | {
     404: _problem_response("Resource not found"),
 }
+AUDIO_ASSET_READ_RESPONSES = {
+    code: {
+        **response,
+        "headers": {
+            **response.get("headers", {}),
+            "Cache-Control": {"schema": {"type": "string", "const": "no-store"}},
+        },
+    }
+    for code, response in {
+        200: {"description": "Current committed Audio Asset summary"},
+        **NOT_FOUND_RESPONSES,
+        500: _problem_response("Internal server error"),
+    }.items()
+}
 CONFLICT_RESPONSES = NOT_FOUND_RESPONSES | {
     409: _problem_response("Command conflicts with existing state"),
 }
@@ -506,7 +528,7 @@ CREATED_RESPONSE = {
 }
 
 router = APIRouter(
-    prefix="/api/v1",
+    prefix=PROJECT_API_PREFIX,
     tags=["projects"],
     dependencies=[Depends(enforce_request_limit)],
 )
@@ -687,6 +709,19 @@ async def upload_audio_frame(
         )
     finally:
         lease.release()
+
+
+@router.get(AUDIO_ASSET_READ_PATH, responses=AUDIO_ASSET_READ_RESPONSES)
+def get_audio_asset(
+    audio_asset_id: UUID4,
+    user_id: AuthenticatedUser,
+    storage: Storage,
+) -> AudioAssetReadResponse:
+    asset, server_time_ms = storage.get_audio_asset(user_id, audio_asset_id)
+    return AudioAssetReadResponse(
+        audio_asset=_audio_asset_response(asset),
+        server_time=timestamp_to_rfc3339(server_time_ms),
+    )
 
 
 @router.post(
