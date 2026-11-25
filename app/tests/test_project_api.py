@@ -3,6 +3,7 @@ import errno
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -293,6 +294,75 @@ def test_section_creation_is_canonical_idempotent_and_visible_in_document(
     }
     assert "sealedAt" not in section["audioAsset"]
     assert detail.json()["serverTime"] >= section["audioAsset"]["updatedAt"]
+
+
+def test_audio_asset_read_returns_current_committed_summary(client: TestClient) -> None:
+    project = create_project(client)
+    section, _response = create_section(client, project["id"])
+    asset_id = section["audioAssetId"]
+    endpoint = f"/api/v1/audio-assets/{asset_id}"
+
+    initial = client.get(endpoint, headers=auth())
+    uploaded = upload_frame(client, asset_id, 0)
+    after_upload = client.get(endpoint, headers=auth())
+    confirmed = client.post(
+        f"{endpoint}/confirm-ended", json={"frameCount": 1}, headers=auth()
+    )
+    after_seal = client.get(endpoint, headers=auth())
+
+    assert uploaded.status_code == 200
+    assert confirmed.status_code == 200
+    for response in (initial, after_upload, after_seal):
+        assert response.status_code == 200
+        assert response.headers["cache-control"] == "no-store"
+        assert response.json().keys() == {"audioAsset", "serverTime"}
+        assert re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z", response.json()["serverTime"]
+        )
+    assert initial.json()["audioAsset"] == section["audioAsset"]
+    updated = after_upload.json()["audioAsset"]
+    assert updated["frameCount"] == 1
+    assert updated["observedDurationMs"] == 1_000
+    assert updated["isSealed"] is False
+    assert after_seal.json()["audioAsset"] == confirmed.json()
+    assert after_seal.json()["audioAsset"]["sealReason"] == "user_resolved"
+
+
+def test_audio_asset_read_errors_are_private_and_not_cacheable(client: TestClient) -> None:
+    project = create_project(client)
+    section, _response = create_section(client, project["id"])
+    endpoint = f"/api/v1/audio-assets/{section['audioAssetId']}"
+
+    unauthenticated = client.get(endpoint)
+    foreign = client.get(endpoint, headers=auth("Bob"))
+    missing = client.get(f"/api/v1/audio-assets/{uuid4()}", headers=auth("Bob"))
+    invalid = client.get("/api/v1/audio-assets/invalid", headers=auth())
+
+    for response, status in (
+        (unauthenticated, 401),
+        (foreign, 404),
+        (missing, 404),
+        (invalid, 422),
+    ):
+        assert response.status_code == status
+        assert response.headers["cache-control"] == "no-store"
+    assert foreign.json() == missing.json()
+
+
+def test_audio_asset_read_unexpected_error_is_not_cacheable(
+    database_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_read(_storage: ProjectStorage, _owner: UUID, _asset: UUID) -> None:
+        raise RuntimeError("injected read failure")
+
+    monkeypatch.setattr(ProjectStorage, "get_audio_asset", fail_read)
+    app = create_app(settings_for(database_path))
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.get(f"/api/v1/audio-assets/{uuid4()}", headers=auth())
+
+    assert response.status_code == 500
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json()["code"] == "internal_error"
 
 
 def test_audio_frame_upload_is_acknowledged_and_visible_in_project_detail(
@@ -1435,6 +1505,14 @@ def test_openapi_declares_routes_security_locations_and_problem_details(
 ) -> None:
     schema = create_app(settings_for(database_path)).openapi()
     paths = schema["paths"]
+
+    asset_read = paths["/api/v1/audio-assets/{audio_asset_id}"]["get"]
+    assert asset_read["security"] == [{"ApplicationSession": []}]
+    for response in asset_read["responses"].values():
+        assert response["headers"]["Cache-Control"]["schema"]["const"] == "no-store"
+    asset_read_schema = schema["components"]["schemas"]["AudioAssetReadResponse"]
+    assert set(asset_read_schema["required"]) == {"audioAsset", "serverTime"}
+    assert asset_read_schema["properties"]["serverTime"]["format"] == "date-time"
 
     assert {
         "/api/v1/projects",

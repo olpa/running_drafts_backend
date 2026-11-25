@@ -9,7 +9,10 @@ from fastapi import APIRouter, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.datastructures import MutableHeaders
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.routing import compile_path, get_route_path
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from running_drafts.auth import SESSION_COOKIE_NAME
 from running_drafts.auth_routes import router as auth_router
@@ -28,6 +31,8 @@ from running_drafts.migrations import MIGRATION_HEAD
 from running_drafts.oauth import ProviderRegistry, create_provider_registry
 from running_drafts.problems import ProblemException, problem_response
 from running_drafts.project_api import (
+    AUDIO_ASSET_READ_PATH,
+    PROJECT_API_PREFIX,
     ConcurrentDownloadLimitExceeded,
     DownloadCapacity,
 )
@@ -62,6 +67,32 @@ from running_drafts.settings import AppEnvironment, Settings
 from running_drafts.test_control import CONTROL_PREFIX, create_test_control_router
 
 logger = logging.getLogger(__name__)
+_AUDIO_ASSET_READ_PATTERN, _, _ = compile_path(PROJECT_API_PREFIX + AUDIO_ASSET_READ_PATH)
+
+
+def _is_audio_asset_read(scope: Scope) -> bool:
+    return (
+        scope["type"] == "http"
+        and scope["method"] == "GET"
+        and _AUDIO_ASSET_READ_PATTERN.fullmatch(get_route_path(scope)) is not None
+    )
+
+
+class AudioAssetReadCacheMiddleware:
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if not _is_audio_asset_read(scope):
+            await self.app(scope, receive, send)
+            return
+
+        async def send_no_store(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                MutableHeaders(scope=message)["Cache-Control"] = "no-store"
+            await send(message)
+
+        await self.app(scope, receive, send_no_store)
 
 
 class SchemaVersionMismatch(RuntimeError):
@@ -187,6 +218,8 @@ def create_app(
         ],
     )
     app.add_middleware(CookieOriginMiddleware, allowed_origins=settings.allowed_origins)
+
+    app.add_middleware(AudioAssetReadCacheMiddleware)
 
     @app.exception_handler(ProblemException)
     def handle_problem(_request: Request, error: ProblemException) -> JSONResponse:
@@ -523,13 +556,17 @@ def create_app(
             reference_id,
             exc_info=(type(error), error, error.__traceback__),
         )
-        return problem_response(
+        response = problem_response(
             status=500,
             title="Internal server error",
             detail="The server could not complete the request.",
             code="internal_error",
             extensions={"referenceId": reference_id},
         )
+        # The outer server error handler sends this response outside user middleware.
+        if _is_audio_asset_read(_request.scope):
+            response.headers["Cache-Control"] = "no-store"
+        return response
 
     health = APIRouter(prefix="/health", tags=["health"])
 

@@ -455,6 +455,26 @@ class ProjectStorage:
         )
         return ProjectDetail(_project_summary(project), sections, self._clock_ms())
 
+    def get_audio_asset(
+        self, owner_id: UUID, audio_asset_id: UUID
+    ) -> tuple[AudioAssetSummary, int]:
+        with self._connection() as connection:
+            self._assert_account_active(connection, owner_id)
+            row = connection.execute(
+                """
+                SELECT audio_assets.*, audio_assets.id AS audio_asset_id
+                FROM audio_assets
+                JOIN sections ON sections.id = audio_assets.section_id
+                JOIN projects ON projects.id = sections.project_id
+                WHERE audio_assets.id = ? AND projects.owner_id = ?
+                """,
+                (str(audio_asset_id), str(owner_id)),
+            ).fetchone()
+            if row is None:
+                raise ResourceNotFound
+            server_time_ms = self._clock_ms()
+        return _audio_asset_summary(row), server_time_ms
+
     def rename_project(
         self,
         owner_id: UUID,

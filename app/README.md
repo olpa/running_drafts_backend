@@ -151,6 +151,12 @@ asset's `updatedAt`; idempotent retries do not. Project detail also includes
 `serverTime` as response metadata so clients can compare server-authored
 activity evidence without relying on the browser clock.
 
+`GET /api/v1/audio-assets/{audio_asset_id}` returns the current committed
+summary as `audioAsset` and a post-read `serverTime` for **Check again**. It
+requires an Application Session for the owning Account and returns the same
+`404` for missing and foreign assets. Every response carries
+`Cache-Control: no-store`.
+
 `POST /api/v1/audio-assets/{audio_asset_id}/confirm-ended` accepts a required
 `frameCount`. It atomically seals a matching open asset as `user_resolved`. If a
 new frame committed after the represented state, the command leaves the asset
